@@ -10,6 +10,7 @@ Marketing site for Gatherable, LLC (https://gatherablehub.com) with two AI featu
 - **Online booking** (`/admin` → Online booking): paste a Cal.com or Calendly link and switch it on; visitors get a "Pick a time now" button and the calendar opens after they send the contact form.
 - **Legal pages** (`/privacy`, `/terms`): drafted, hidden until switched on in `/admin` → Legal pages; then linked in every footer and added to the sitemap.
 - **Lead tracking** (`/admin` → Leads): status, follow-up dates with due alerts, notes, filters, search and CSV export.
+- **Email** (`/admin` → Email, via [Resend](https://resend.com)): paste a Full-access API key, set up the sending domain (DNS records shown in admin), then lead/sale alerts, Pitch Check reports, purchase emails with the download link, a daily follow-up summary and an optional Pitch Check follow-up. All sends are logged in `email_log`.
 - **SEO** (`/admin` → SEO): per-page Google title and description with a live preview and checks, Search Console / Bing verification, optional Google Analytics. The server also serves `robots.txt`, `sitemap.xml`, social preview tags and structured data (business, founder, FAQ), with gzip compression.
 - **Admin** (`/admin`, HTTP Basic auth; the password can be changed in the admin page, falling back to `ADMIN_PASSWORD`): lists leads, AI briefs and Pitch Check results, with a status per lead.
 
@@ -27,6 +28,7 @@ Marketing site for Gatherable, LLC (https://gatherablehub.com) with two AI featu
 | `server.js` | HTTP server: static files, `/api/intake`, `/api/review`, `/admin`, `/api/health` |
 | `site.js` | Renders pages with text edits and SEO settings; robots, sitemap, structured data |
 | `admin-assets/editor.js` | The in-page text editor (served only behind the admin password) |
+| `email.js` | Resend client and email templates |
 | `prompts.js` | Review criteria, system prompts and output schemas. **The criteria are a draft: refine them with George.** |
 | `public/` | Site pages, styles, scripts and images |
 

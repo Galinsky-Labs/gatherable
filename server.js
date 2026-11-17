@@ -10,6 +10,7 @@ import Stripe from "stripe";
 import { REVIEW_SYSTEM, REVIEW_SCHEMA, BRIEF_SYSTEM, BRIEF_SCHEMA } from "./prompts.js";
 import zlib from "node:zlib";
 import { createSite, PAGES, sanitizeInline } from "./site.js";
+import { createMailer, leadAlertEmail, pitchReportEmail, purchaseEmail, saleAlertEmail, digestEmail, followUpEmail, testEmail } from "./email.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(here, "public");
@@ -94,8 +95,23 @@ async function migrate() {
       download_count    INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS orders_created_idx ON orders (created_at DESC);
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS emailed_at TIMESTAMPTZ;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS follow_up_at DATE;
     ALTER TABLE leads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS alerted_at TIMESTAMPTZ;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS followup_sent_at TIMESTAMPTZ;
+    CREATE TABLE IF NOT EXISTS email_log (
+      id          BIGSERIAL PRIMARY KEY,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      kind        TEXT NOT NULL,
+      recipient   TEXT NOT NULL,
+      subject     TEXT,
+      status      TEXT NOT NULL,
+      error       TEXT,
+      ref         TEXT,
+      provider_id TEXT
+    );
+    CREATE INDEX IF NOT EXISTS email_log_created_idx ON email_log (created_at DESC);
     CREATE TABLE IF NOT EXISTS lead_notes (
       id         BIGSERIAL PRIMARY KEY,
       lead_id    BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
@@ -156,6 +172,12 @@ function decrypt(blob) {
   const d = crypto.createDecipheriv("aes-256-gcm", SETTINGS_KEY, Buffer.from(iv, "base64"));
   d.setAuthTag(Buffer.from(tag, "base64"));
   return Buffer.concat([d.update(Buffer.from(enc, "base64")), d.final()]).toString("utf8");
+}
+const mailer = createMailer({ pool, encrypt: (t) => encrypt(t), decrypt: (t) => decrypt(t), canEncrypt: !!SETTINGS_KEY });
+const BASE_URL = process.env.CANONICAL_HOST ? `https://${process.env.CANONICAL_HOST}` : "";
+async function bookUrl() {
+  const b = await site.getBooking();
+  return b.live && b.url ? b.url : `${BASE_URL}/#contact`;
 }
 let payCache = null; // { stripe, webhookSecret, source, mode, last4, webhookId }
 async function getPayments() {
@@ -297,7 +319,12 @@ async function handleIntake(req, res) {
     id = r.rows[0].id;
   }
   json(res, 200, { ok: true, recommendation: RECOMMEND[lead.topic] });
-  if (id && anthropic) buildBrief(id, lead).catch((e) => console.error("brief failed", id, e.message));
+  if (id)
+    (async () => {
+      let brief = null;
+      if (anthropic) brief = await buildBrief(id, lead).catch((e) => (console.error("brief failed", id, e.message), null));
+      await alertLead(id, lead, { brief });
+    })().catch((e) => console.error("lead follow-up failed", id, e.message));
 }
 
 async function buildBrief(id, lead) {
@@ -308,6 +335,17 @@ async function buildBrief(id, lead) {
   )}`;
   const { data } = await askClaude({ system: BRIEF_SYSTEM, content, schema: BRIEF_SCHEMA, effort: "low", maxTokens: 8000 });
   await pool.query("UPDATE leads SET ai_brief=$1 WHERE id=$2", [data, id]);
+  return data;
+}
+
+// Emails George about a new lead, once (with the AI brief or Pitch Check result when there is one).
+async function alertLead(id, lead, { brief, review } = {}) {
+  const cfg = await mailer.getConfig();
+  if (!cfg.toggles.leadAlerts || !mailer.ready(cfg) || !cfg.alertTo) return;
+  const claimed = await pool.query("UPDATE leads SET alerted_at=now() WHERE id=$1 AND alerted_at IS NULL RETURNING id", [id]);
+  if (!claimed.rows[0]) return;
+  const m = leadAlertEmail({ lead, topicLabel: TOPICS[lead.topic] || lead.topic, brief, review, adminUrl: `${BASE_URL}/admin#leads` });
+  await mailer.send({ to: cfg.alertTo, ...m, kind: review ? "pitch_alert" : "lead_alert", ref: id, replyTo: lead.email });
 }
 
 async function handleReview(req, res) {
@@ -373,6 +411,14 @@ async function handleReview(req, res) {
         [data, model, usage?.input_tokens ?? null, usage?.output_tokens ?? null, reviewId]
       );
     json(res, 200, { ok: true, result: data });
+    (async () => {
+      const cfg = await mailer.getConfig();
+      if (cfg.toggles.pitchReports && mailer.ready(cfg)) {
+        const m = pitchReportEmail({ name, docType, result: data, bookUrl: await bookUrl() });
+        await mailer.send({ to: email, ...m, kind: "pitch_report", ref: reviewId });
+      }
+      if (leadId) await alertLead(leadId, { name, email, company: clean(b.company, 160), role, topic: "pitch", answers: { doc_type: docType, context } }, { review: data });
+    })().catch((e) => console.error("pitch emails failed", e.message));
   } catch (e) {
     console.error("review failed", reviewId, e?.status, e?.message);
     if (pool) await pool.query("UPDATE reviews SET status='error', error=$1 WHERE id=$2", [String(e?.message).slice(0, 500), reviewId]);
@@ -437,8 +483,80 @@ async function recordPayment(session) {
       WHERE stripe_session_id=$1 RETURNING *`,
     [session.id, session.customer_details?.email || null, session.customer_details?.name || null, session.amount_total, session.currency]
   );
-  return r.rows[0] || null;
+  const order = r.rows[0] || null;
+  if (order) sendOrderEmails(order.id).catch((e) => console.error("order emails failed", order.id, e.message));
+  return order;
 }
+
+// Download link to the buyer and a sale alert to George, sent once per order.
+async function sendOrderEmails(orderId) {
+  const cfg = await mailer.getConfig();
+  if (!mailer.ready(cfg)) return;
+  const r = await pool.query(
+    `UPDATE orders o SET emailed_at=now() FROM products p WHERE o.id=$1 AND o.emailed_at IS NULL AND o.status='paid' AND p.id=o.product_id
+     RETURNING o.*, p.title`,
+    [orderId]
+  );
+  const o = r.rows[0];
+  if (!o || !o.email) return;
+  const amount = o.amount_cents != null ? (o.amount_cents / 100).toLocaleString("en-US", { style: "currency", currency: (o.currency || "usd").toUpperCase() }) : "";
+  if (cfg.toggles.buyerEmails)
+    await mailer.send({ to: o.email, ...purchaseEmail({ name: o.name, title: o.title, downloadUrl: `${BASE_URL}/download/${o.download_token}`, amount }), kind: "purchase", ref: o.id });
+  if (cfg.toggles.leadAlerts && cfg.alertTo)
+    await mailer.send({ to: cfg.alertTo, ...saleAlertEmail({ title: o.title, name: o.name, email: o.email, amount, adminUrl: `${BASE_URL}/admin#sales` }), kind: "sale_alert", ref: o.id });
+}
+
+// ---- scheduled emails (daily summary, Pitch Check follow-ups) ----
+// Runs every 10 minutes while the server is awake, and is nudged by incoming requests.
+let lastScheduledRun = 0;
+async function runScheduled() {
+  if (!pool || Date.now() - lastScheduledRun < 5 * 60e3) return;
+  lastScheduledRun = Date.now();
+  const cfg = await mailer.getConfig();
+  if (!mailer.ready(cfg)) return;
+  const nowEt = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  if (cfg.toggles.dailyDigest && cfg.alertTo && nowEt.getHours() >= 8) {
+    const claimed = await pool.query(
+      `INSERT INTO settings (key,value,updated_at) VALUES ('digest_last',$1,now())
+       ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now() WHERE settings.value <> EXCLUDED.value RETURNING key`,
+      [JSON.stringify(today)]
+    );
+    if (claimed.rows[0]) {
+      const due = (
+        await pool.query(
+          `SELECT l.name, l.company, l.status, to_char(l.follow_up_at,'Mon DD') AS follow_up_at,
+                  (SELECT body FROM lead_notes n WHERE n.lead_id=l.id ORDER BY created_at DESC LIMIT 1) AS last_note
+             FROM leads l WHERE l.status IN ('new','contacted','meeting','proposal') AND l.follow_up_at <= $1::date ORDER BY l.follow_up_at`,
+          [today]
+        )
+      ).rows;
+      const fresh = (await pool.query("SELECT name, company, source FROM leads WHERE created_at > now() - interval '1 day' ORDER BY created_at DESC")).rows;
+      if (due.length || fresh.length)
+        await mailer.send({ to: cfg.alertTo, ...digestEmail({ due, fresh, adminUrl: `${BASE_URL}/admin#leads` }), kind: "digest" });
+    }
+  }
+  if (cfg.toggles.followUp) {
+    const days = Math.min(Math.max(Number(cfg.followUpDays) || 4, 1), 30);
+    const rows = (
+      await pool.query(
+        `UPDATE leads l SET followup_sent_at=now()
+          WHERE l.id IN (
+            SELECT l2.id FROM leads l2
+             WHERE l2.source='pitch_check' AND l2.status='new' AND l2.followup_sent_at IS NULL
+               AND l2.created_at < now() - ($1 || ' days')::interval AND l2.created_at > now() - interval '30 days'
+               AND NOT EXISTS (SELECT 1 FROM leads o WHERE lower(o.email)=lower(l2.email) AND o.source='intake')
+             LIMIT 20)
+          RETURNING l.id, l.name, l.email,
+            (SELECT (r.result->>'overall_score') FROM reviews r WHERE r.lead_id=l.id AND r.status='done' ORDER BY r.created_at DESC LIMIT 1) AS score`,
+        [String(days)]
+      )
+    ).rows;
+    const url = await bookUrl();
+    for (const l of rows) await mailer.send({ to: l.email, ...followUpEmail({ name: l.name, score: l.score, bookUrl: url }), kind: "followup", ref: l.id });
+  }
+}
+setInterval(() => runScheduled().catch((e) => console.error("scheduled emails failed", e.message)), 10 * 60e3).unref();
 
 async function handleOrderStatus(req, res, url) {
   const { stripe } = await getPayments();
@@ -849,6 +967,77 @@ async function handleLeadsCsv(req, res) {
   res.end("\ufeff" + csv);
 }
 
+// ---- email settings (Resend) ----
+async function handleAdminEmail(req, res) {
+  if (!SETTINGS_KEY) return json(res, 503, { error: "SETTINGS_ENCRYPTION_KEY is not set on the server." });
+  const b = await readBody(req, 16 * 1024);
+  const cfg = await mailer.getConfig();
+  const domainInfo = (list, name) => (list?.data || []).find((d) => d.name === name);
+  try {
+    if (b.action === "saveKey") {
+      const key = clean(b.apiKey, 200);
+      if (!/^re_[A-Za-z0-9_]{10,}$/.test(key)) return json(res, 400, { error: "That doesn't look like a Resend API key. It starts with re_." });
+      let list;
+      try {
+        list = await mailer.api("/domains", { key });
+      } catch (e) {
+        if (e.status === 401 || e.status === 403)
+          return json(res, 400, { error: "Resend didn't accept that key for setup. Create a key with Full access (not Sending access) and paste it again." });
+        throw e;
+      }
+      const d = domainInfo(list, cfg.domain);
+      await mailer.saveConfig({ ...cfg, apiKey: key, domainId: d?.id || "", domainStatus: d?.status || "" });
+      return json(res, 200, { ok: true });
+    }
+    if (!cfg.apiKey) return json(res, 400, { error: "Connect your Resend API key first." });
+    if (b.action === "setupDomain") {
+      let d;
+      try {
+        d = await mailer.api("/domains", { method: "POST", body: { name: cfg.domain } });
+      } catch (e) {
+        const list = await mailer.api("/domains");
+        d = domainInfo(list, cfg.domain);
+        if (!d) throw e;
+      }
+      await mailer.saveConfig({ ...cfg, domainId: d.id, domainStatus: d.status || "not_started" });
+      return json(res, 200, { ok: true });
+    }
+    if (b.action === "verify") {
+      if (!cfg.domainId) return json(res, 400, { error: "Set up the domain first." });
+      await mailer.api(`/domains/${cfg.domainId}/verify`, { method: "POST" }).catch(() => {});
+      const d = await mailer.api(`/domains/${cfg.domainId}`);
+      await mailer.saveConfig({ ...cfg, domainStatus: d.status });
+      return json(res, 200, { ok: true, status: d.status });
+    }
+    if (b.action === "settings") {
+      const EM = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]{2,}$/;
+      const fromName = clean(b.fromName, 80).replace(/[<>"]/g, "") || "Gatherable";
+      const fromLocal = clean(b.fromLocal, 64).toLowerCase();
+      if (!/^[a-z0-9._-]+$/.test(fromLocal)) return json(res, 400, { error: "The sender address can only use letters, numbers, dots, dashes and underscores." });
+      const replyTo = clean(b.replyTo, 200), alertTo = clean(b.alertTo, 200);
+      if (replyTo && !EM.test(replyTo)) return json(res, 400, { error: "The reply-to address doesn't look right." });
+      if (!EM.test(alertTo)) return json(res, 400, { error: "Enter the address that should receive lead alerts." });
+      const toggles = {};
+      for (const k of Object.keys(cfg.toggles)) toggles[k] = !!b.toggles?.[k];
+      await mailer.saveConfig({ ...cfg, from: `${fromName} <${fromLocal}@${cfg.domain}>`, replyTo, alertTo, toggles, followUpDays: Math.min(Math.max(Number(b.followUpDays) || 4, 1), 30) });
+      return json(res, 200, { ok: true });
+    }
+    if (b.action === "test") {
+      if (!mailer.ready(cfg)) return json(res, 400, { error: "The domain isn't verified yet, so emails can't be sent." });
+      const r = await mailer.send({ to: cfg.alertTo, ...testEmail(), kind: "test" });
+      if (r.status !== "sent") return json(res, 502, { error: "Resend refused the email: " + (r.error || "unknown error") });
+      return json(res, 200, { ok: true, to: cfg.alertTo });
+    }
+    if (b.action === "remove") {
+      await mailer.saveConfig({ ...cfg, apiKey: "", domainId: "", domainStatus: "" });
+      return json(res, 200, { ok: true });
+    }
+  } catch (e) {
+    return json(res, 502, { error: "Resend: " + e.message });
+  }
+  json(res, 400, { error: "Unknown action." });
+}
+
 async function handleAdminSeo(req, res) {
   const b = await readBody(req, 16 * 1024);
   const seo = await site.getSeo();
@@ -882,6 +1071,7 @@ async function handleAdmin(req, res, url) {
   if (req.method === "POST" && url.pathname === "/admin/content") return await handleAdminContent(req, res);
   if (req.method === "POST" && url.pathname === "/admin/seo") return await handleAdminSeo(req, res);
   if (req.method === "POST" && url.pathname === "/admin/media") return await handleAdminMedia(req, res);
+  if (req.method === "POST" && url.pathname === "/admin/email") return await handleAdminEmail(req, res);
   if (req.method === "POST" && url.pathname === "/admin/legal") return await handleAdminLegal(req, res);
   if (req.method === "POST" && url.pathname === "/admin/booking") return await handleAdminBooking(req, res);
   if (req.method === "POST" && url.pathname === "/admin/lead") return await handleAdminLead(req, res);
@@ -1059,6 +1249,47 @@ async function handleAdmin(req, res, url) {
       <div><button>Save link</button> ${booking.url ? `<a class="btnlink alt" href="${esc(booking.url)}" target="_blank" rel="noopener">Preview calendar ↗</a>` : ""} <span class="msg"></span></div>
       <label class="switch big"><input type="checkbox" id="booking-live"${booking.live ? " checked" : ""}${booking.url ? "" : " disabled"}> <span>Show online booking on the website</span></label>
     </form></section>`;
+  const ecfg = await mailer.getConfig();
+  let domain = null;
+  if (ecfg.apiKey && ecfg.domainId) {
+    try {
+      domain = await Promise.race([mailer.api(`/domains/${ecfg.domainId}`), new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 6000))]);
+      if (domain.status && domain.status !== ecfg.domainStatus) { await mailer.saveConfig({ ...ecfg, domainStatus: domain.status }); ecfg.domainStatus = domain.status; }
+    } catch {}
+  }
+  const emailReady = mailer.ready(ecfg);
+  const fromMatch = /^(.*?)\s*<([^@>]+)@/.exec(ecfg.from) || [];
+  const recent = (await pool.query("SELECT created_at, kind, recipient, subject, status, error FROM email_log ORDER BY created_at DESC LIMIT 15")).rows;
+  const KIND = { lead_alert: "Lead alert", pitch_alert: "Pitch Check alert", pitch_report: "Pitch Check report", purchase: "Purchase", sale_alert: "Sale alert", digest: "Daily summary", followup: "Follow-up", test: "Test" };
+  const tog = (k, label, hint) => `<label class="switch"><input type="checkbox" data-t="${k}"${ecfg.toggles[k] ? " checked" : ""}> <span>${label}</span></label><p class="hint">${hint}</p>`;
+  const recHost = (n) => (n && n !== "@" ? n + "." + ecfg.domain : ecfg.domain);
+  const emailHtml = `<section id="email"><h2>Email</h2>
+    ${emailReady ? `<p class="ok">✓ Sending from <b>${esc(ecfg.from)}</b>. Domain verified.</p>` : ecfg.apiKey ? `<p class="warn">Resend is connected. ${ecfg.domainId ? `Domain status: <b>${esc(ecfg.domainStatus || "pending")}</b>. Emails start once it's verified.` : "Next: set up the domain below."}</p>` : '<p class="warn">Email is off. Connect Resend below to send lead alerts, Pitch Check reports and download emails.</p>'}
+    <form id="email-key" class="prod">
+      <label>Resend API key${ecfg.apiKey ? " (connected; paste a new one to replace it)" : ""}<input name="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="re_…"></label>
+      <p class="hint">In Resend: <b>API Keys → Create API key</b>, permission <b>Full access</b>. It's checked, stored encrypted and never shown again.</p>
+      <div><button>Save key</button> ${ecfg.apiKey ? '<button type="button" class="danger" id="email-remove">Disconnect</button>' : ""} <span class="msg"></span></div>
+    </form>
+    ${ecfg.apiKey ? `<div class="prod"><b>Sending domain: ${esc(ecfg.domain)}</b>
+      ${ecfg.domainId ? `${domain?.records?.length ? `<p class="hint">These DNS records must exist at the domain's DNS host (Wix). Status updates when you click Check.</p>
+        <div class="tablewrap"><table class="dns"><tr><th>Type</th><th>Host</th><th>Value</th><th>Priority</th><th>Status</th></tr>${domain.records.map((r) => `<tr><td>${esc(r.type)}</td><td><code>${esc(recHost(r.name))}</code></td><td><code>${esc(r.value)}</code></td><td>${esc(r.priority ?? "")}</td><td>${esc(r.status)}</td></tr>`).join("")}</table></div>` : ""}
+        <div><button type="button" id="email-verify">Check verification</button> <span class="msg" id="verify-msg"></span></div>` : `<p class="hint">Creates ${esc(ecfg.domain)} in Resend and lists the DNS records to add.</p><div><button type="button" id="email-domain">Set up ${esc(ecfg.domain)}</button> <span class="msg"></span></div>`}
+    </div>` : ""}
+    <form id="email-settings" class="prod">
+      <div class="g2"><label>Sender name<input name="fromName" value="${esc(fromMatch[1] || "Gatherable")}"></label>
+      <label>Sender address<span class="addr"><input name="fromLocal" value="${esc(fromMatch[2] || "hello")}"><span>@${esc(ecfg.domain)}</span></span></label>
+      <label>Replies go to<input name="replyTo" type="email" value="${esc(ecfg.replyTo)}"></label>
+      <label>Lead alerts and summaries go to<input name="alertTo" type="email" value="${esc(ecfg.alertTo)}"></label></div>
+      ${tog("leadAlerts", "Lead and sale alerts", "An email to you for every inquiry, Pitch Check and sale, with the AI brief.")}
+      ${tog("pitchReports", "Pitch Check reports", "Emails the full scorecard to the person who ran it, with a button to book a meeting.")}
+      ${tog("buyerEmails", "Purchase emails", "Sends buyers their download link right after they pay.")}
+      ${tog("dailyDigest", "Daily summary", "Each morning (after 8am Eastern): follow-ups due and new leads. Skipped on days with nothing to report.")}
+      ${tog("followUp", "Pitch Check follow-up", "One friendly email from you to Pitch Check users who haven't contacted you, after")}
+      <label class="days">days to wait<input name="followUpDays" type="number" min="1" max="30" value="${esc(ecfg.followUpDays)}"></label>
+      <div><button>Save email settings</button> ${emailReady ? '<button type="button" id="email-test" class="alt2">Send test email</button>' : ""} <span class="msg"></span></div>
+    </form>
+    ${recent.length ? `<h3>Recent emails</h3><div class="tablewrap"><table><tr><th>When</th><th>Type</th><th>To</th><th>Status</th></tr>${recent.map((e) => `<tr><td>${esc(fmtDate(e.created_at))}</td><td>${esc(KIND[e.kind] || e.kind)}</td><td>${esc(e.recipient)}</td><td>${e.status === "sent" ? "Sent" : `<span class="fail">Failed</span> <small>${esc(e.error || "")}</small>`}</td></tr>`).join("")}</table></div>` : ""}
+  </section>`;
   const passwordHtml = `<section id="password"><h2>Admin password</h2>
     <form id="pw-form" class="prod">
       <label>Current password<input name="current" type="password" autocomplete="current-password" required></label>
@@ -1076,6 +1307,7 @@ async function handleAdmin(req, res, url) {
     ["booking", "Online booking", booking.live ? "" : '<b class="badge muted">off</b>'],
     ["legal", "Legal pages", legal.privacy && legal.terms ? "" : '<b class="badge muted">draft</b>'],
     ["seo", "SEO", aud.site.some(([ok]) => ok === false) || aud.pages.some((p) => p.checks.some(([ok]) => ok === false)) ? '<b class="badge warnb">!</b>' : ""],
+    ["email", "Email", emailReady ? "" : '<b class="badge muted">off</b>'],
     ["password", "Password", ""],
     ["payments", "Payments", pay.stripe ? "" : '<b class="badge warnb">off</b>'],
   ];
@@ -1129,6 +1361,8 @@ fieldset{border:1px solid #D5E2E4;border-radius:10px;padding:12px 14px;margin:0;
 .pill{font-size:.75rem;border-radius:999px;padding:1px 8px;background:#f0efec;color:#526276}.pill.on{background:#e5f4e4;color:#2b6a2f}
 .switch{display:inline-flex!important;gap:8px;align-items:center;font-weight:600;cursor:pointer}.switch input{width:18px;height:18px}.switch.big{margin-top:6px}
 .thumb{width:48px;height:32px;object-fit:cover;border-radius:4px;vertical-align:middle}
+.tablewrap{overflow-x:auto}.dns code{font-size:.8rem;word-break:break-all}.addr{display:flex;align-items:center;gap:4px}.addr input{flex:1}
+.days{max-width:160px}.prod button.alt2{background:#13468B}span.fail{color:#b42318;font-weight:600}
 @media(max-width:800px){.layout{grid-template-columns:minmax(0,1fr)}.layout>*{min-width:0}.side{position:sticky;height:auto;display:flex;gap:4px;overflow-x:auto;padding:10px;z-index:5}
 .side .brand,.side .sep,.side .foot{display:none}.side a{white-space:nowrap;margin:0}main{padding:18px 14px}.g2{grid-template-columns:1fr}}
 </style></head>
@@ -1140,7 +1374,7 @@ ${nav.slice(3, 7).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"
 <div class="sep">Settings</div>
 ${nav.slice(7).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"><span>${label}</span>${extra}</a>`).join("")}
 <div class="foot"><a href="/" target="_blank" rel="noopener">View website ↗</a></div></nav>
-<main>${leadsHtml}${productsHtml}${salesHtml}${contentHtml}${bookingHtml}${legalHtml}${seoHtml}${passwordHtml}${payHtml}</main></div>
+<main>${leadsHtml}${productsHtml}${salesHtml}${contentHtml}${bookingHtml}${legalHtml}${seoHtml}${emailHtml}${passwordHtml}${payHtml}</main></div>
 <script>
 document.querySelectorAll('select[data-id]').forEach(s=>s.addEventListener('change',()=>fetch('/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:s.dataset.id,status:s.value})})));
 const sf=document.getElementById('stripe-form');
@@ -1200,6 +1434,21 @@ bf.addEventListener('submit',async e=>{e.preventDefault();const m=bf.querySelect
   try{await post('/admin/booking',{url:bf.elements.url.value});m.textContent='Saved';setTimeout(()=>location.reload(),600)}catch(x){m.textContent=x.message}});
 document.getElementById('booking-live').addEventListener('change',async e=>{const m=bf.querySelector('.msg');
   try{await post('/admin/booking',{live:e.target.checked});m.textContent=e.target.checked?'Booking is live on the website.':'Booking is hidden.';setTimeout(()=>location.reload(),900)}catch(x){m.textContent=x.message;e.target.checked=!e.target.checked}});
+// email
+const ek=document.getElementById('email-key');
+ek.addEventListener('submit',async e=>{e.preventDefault();const m=ek.querySelector('.msg');m.textContent='Checking with Resend…';
+  try{await post('/admin/email',{action:'saveKey',apiKey:ek.elements.apiKey.value.trim()});m.textContent='Connected';setTimeout(()=>location.reload(),700)}catch(x){m.textContent=x.message}});
+const er=document.getElementById('email-remove');if(er)er.addEventListener('click',async()=>{if(!confirm('Disconnect Resend? Emails will stop.'))return;await post('/admin/email',{action:'remove'});location.reload()});
+const ed=document.getElementById('email-domain');if(ed)ed.addEventListener('click',async()=>{const m=ed.nextElementSibling;m.textContent='Setting up…';
+  try{await post('/admin/email',{action:'setupDomain'});location.reload()}catch(x){m.textContent=x.message}});
+const ev=document.getElementById('email-verify');if(ev)ev.addEventListener('click',async()=>{const m=document.getElementById('verify-msg');m.textContent='Checking…';
+  try{const d=await post('/admin/email',{action:'verify'});m.textContent='Status: '+d.status;setTimeout(()=>location.reload(),1200)}catch(x){m.textContent=x.message}});
+const es=document.getElementById('email-settings');
+es.addEventListener('submit',async e=>{e.preventDefault();const m=es.querySelector('.msg');m.textContent='Saving…';const el=es.elements;const toggles={};
+  es.querySelectorAll('[data-t]').forEach(t=>toggles[t.dataset.t]=t.checked);
+  try{await post('/admin/email',{action:'settings',fromName:el.fromName.value,fromLocal:el.fromLocal.value,replyTo:el.replyTo.value,alertTo:el.alertTo.value,followUpDays:el.followUpDays.value,toggles});m.textContent='Saved'}catch(x){m.textContent=x.message}});
+const et=document.getElementById('email-test');if(et)et.addEventListener('click',async()=>{const m=es.querySelector('.msg');m.textContent='Sending…';
+  try{const d=await post('/admin/email',{action:'test'});m.textContent='Test sent to '+d.to}catch(x){m.textContent=x.message}});
 const pf=document.getElementById('pw-form');
 pf.addEventListener('submit',async e=>{e.preventDefault();const m=pf.querySelector('.msg'),btn=pf.querySelector('button'),el=pf.elements;
   if(el.next.value!==el.confirm.value){m.textContent='The new passwords don\\'t match.';return}
@@ -1264,6 +1513,7 @@ const server = http.createServer(async (req, res) => {
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("X-Frame-Options", "DENY");
   const url = new URL(req.url, "http://x");
+  runScheduled().catch((e) => console.error("scheduled emails failed", e.message));
   // Canonical host: send www and onrender traffic to the main domain.
   const host = (req.headers.host || "").toLowerCase();
   if (process.env.CANONICAL_HOST && (host === "www." + process.env.CANONICAL_HOST || host.endsWith(".onrender.com")) && req.method === "GET" && url.pathname !== "/api/health") {
