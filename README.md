@@ -24,7 +24,7 @@ Marketing site for Gatherable, LLC (https://gatherablehub.com) with two AI featu
 
 ## Environment variables
 
-See `.env.example`. Without `STRIPE_SECRET_KEY` the checklist section stays hidden. Add a Stripe webhook for `checkout.session.completed` and `checkout.session.async_payment_succeeded` pointing at `/api/stripe-webhook` and set `STRIPE_WEBHOOK_SECRET`, so orders are recorded even if the buyer closes the tab.
+See `.env.example`. **Stripe setup:** paste the Stripe secret key in `/admin` → Payments. The server checks it with Stripe, creates the webhook (`/api/stripe-webhook`) automatically, and stores both encrypted (AES-256-GCM) in the `settings` table using `SETTINGS_ENCRYPTION_KEY`. Env vars `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` still work as a fallback. Until Stripe is connected the checklist section stays hidden.
 
 Without `ANTHROPIC_API_KEY` the site still works: leads are saved, and the Pitch Check shows a "being set up" message.
 

@@ -92,6 +92,11 @@ async function migrate() {
       download_count    INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS orders_created_idx ON orders (created_at DESC);
+    CREATE TABLE IF NOT EXISTS settings (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
   console.log("database ready");
 }
@@ -100,7 +105,45 @@ async function migrate() {
 const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
 
 // ---------- Stripe ----------
-const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+// Stripe keys come from the admin page (encrypted in the settings table) or, as a fallback, from env vars.
+const STRIPE_OPTS = {};
+const SETTINGS_KEY = process.env.SETTINGS_ENCRYPTION_KEY
+  ? crypto.createHash("sha256").update(process.env.SETTINGS_ENCRYPTION_KEY).digest()
+  : null;
+function encrypt(text) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv("aes-256-gcm", SETTINGS_KEY, iv);
+  const enc = Buffer.concat([c.update(text, "utf8"), c.final()]);
+  return ["v1", iv.toString("base64"), c.getAuthTag().toString("base64"), enc.toString("base64")].join(":");
+}
+function decrypt(blob) {
+  const [, iv, tag, enc] = blob.split(":");
+  const d = crypto.createDecipheriv("aes-256-gcm", SETTINGS_KEY, Buffer.from(iv, "base64"));
+  d.setAuthTag(Buffer.from(tag, "base64"));
+  return Buffer.concat([d.update(Buffer.from(enc, "base64")), d.final()]).toString("utf8");
+}
+let payCache = null; // { stripe, webhookSecret, source, mode, last4, webhookId }
+async function getPayments() {
+  if (payCache) return payCache;
+  let cfg = null;
+  if (pool && SETTINGS_KEY) {
+    try {
+      const r = await pool.query("SELECT value FROM settings WHERE key='stripe'");
+      if (r.rows[0]) cfg = JSON.parse(decrypt(r.rows[0].value));
+    } catch (e) {
+      console.error("could not read Stripe settings:", e.message);
+    }
+  }
+  if (cfg?.secretKey) {
+    payCache = { stripe: new Stripe(cfg.secretKey, STRIPE_OPTS), webhookSecret: cfg.webhookSecret || null, source: "admin",
+      mode: cfg.secretKey.includes("_live_") ? "live" : "test", last4: cfg.secretKey.slice(-4), webhookId: cfg.webhookId || null, savedAt: cfg.savedAt };
+  } else if (process.env.STRIPE_SECRET_KEY) {
+    const k = process.env.STRIPE_SECRET_KEY;
+    payCache = { stripe: new Stripe(k, STRIPE_OPTS), webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || null, source: "env",
+      mode: k.includes("_live_") ? "live" : "test", last4: k.slice(-4), webhookId: null };
+  } else payCache = { stripe: null };
+  return payCache;
+}
 const MAX_DOWNLOADS = 25;
 const MAX_PRODUCT_FILE = 10 * 1024 * 1024;
 
@@ -308,6 +351,7 @@ const siteUrl = (req) =>
   process.env.CANONICAL_HOST ? `https://${process.env.CANONICAL_HOST}` : `${req.headers["x-forwarded-proto"] || "http"}://${req.headers.host}`;
 
 async function handleProducts(req, res) {
+  const { stripe } = await getPayments();
   if (!pool || !stripe) return json(res, 200, { products: [] });
   const r = await pool.query(
     "SELECT slug,title,description,price_cents,currency FROM products WHERE active AND file_data IS NOT NULL ORDER BY id"
@@ -316,6 +360,7 @@ async function handleProducts(req, res) {
 }
 
 async function handleCheckout(req, res) {
+  const { stripe } = await getPayments();
   if (!pool || !stripe) return json(res, 503, { error: "Purchasing isn't available right now. Please try again later." });
   if (rateLimited("checkout:" + clientIp(req), 20, 3600e3)) return json(res, 429, { error: "Too many attempts. Please try again later." });
   const b = await readBody(req, 4096);
@@ -361,6 +406,7 @@ async function recordPayment(session) {
 }
 
 async function handleOrderStatus(req, res, url) {
+  const { stripe } = await getPayments();
   if (!pool || !stripe) return json(res, 503, { error: "unavailable" });
   const sid = clean(url.searchParams.get("session_id"), 200);
   if (!/^cs_[A-Za-z0-9_]+$/.test(sid)) return json(res, 400, { error: "Invalid link." });
@@ -377,6 +423,7 @@ async function handleOrderStatus(req, res, url) {
 }
 
 async function handleStripeWebhook(req, res) {
+  const { stripe, webhookSecret } = await getPayments();
   if (!pool || !stripe) return json(res, 503, { error: "unavailable" });
   const raw = await new Promise((resolve, reject) => {
     const chunks = [];
@@ -385,10 +432,10 @@ async function handleStripeWebhook(req, res) {
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
-  if (!process.env.STRIPE_WEBHOOK_SECRET) return json(res, 503, { error: "Webhook secret not configured" });
+  if (!webhookSecret) return json(res, 503, { error: "Webhook secret not configured" });
   let event;
   try {
-    event = stripe.webhooks.constructEvent(raw, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
+    event = stripe.webhooks.constructEvent(raw, req.headers["stripe-signature"], webhookSecret);
   } catch (e) {
     return json(res, 400, { error: "Invalid signature" });
   }
@@ -469,6 +516,57 @@ async function handleAdminProduct(req, res) {
   }
 }
 
+// Saves a pasted Stripe key: verifies it, creates the webhook automatically, stores both encrypted.
+async function handleAdminStripe(req, res) {
+  if (!SETTINGS_KEY) return json(res, 503, { error: "SETTINGS_ENCRYPTION_KEY is not set on the server." });
+  const b = await readBody(req, 8192);
+  const current = await getPayments();
+  if (b.action === "remove") {
+    if (current.source === "admin" && current.stripe && current.webhookId) {
+      await current.stripe.webhookEndpoints.del(current.webhookId).catch(() => {});
+    }
+    await pool.query("DELETE FROM settings WHERE key='stripe'");
+    payCache = null;
+    return json(res, 200, { ok: true });
+  }
+  const key = clean(b.secretKey, 300);
+  if (!/^(sk|rk)_(live|test)_[A-Za-z0-9]{10,}$/.test(key))
+    return json(res, 400, { error: "That doesn't look like a Stripe secret key. It starts with sk_live_ (or sk_test_ for testing)." });
+  const candidate = new Stripe(key, STRIPE_OPTS);
+  try {
+    await candidate.balance.retrieve();
+  } catch (e) {
+    return json(res, 400, { error: "Stripe didn't accept that key: " + (e?.message || "unknown error") });
+  }
+  let webhookSecret = clean(b.webhookSecret, 300) || null;
+  let webhookId = null;
+  let webhookNote = "";
+  if (!webhookSecret) {
+    try {
+      const ep = await candidate.webhookEndpoints.create({
+        url: `${siteUrl(req)}/api/stripe-webhook`,
+        enabled_events: ["checkout.session.completed", "checkout.session.async_payment_succeeded"],
+        description: "Gatherable website (created from the admin page)",
+      });
+      webhookSecret = ep.secret;
+      webhookId = ep.id;
+    } catch (e) {
+      webhookNote = "The key works, but Stripe didn't let the site create its webhook automatically. Sales still work; add the webhook signing secret below for extra reliability.";
+    }
+  }
+  // Remove the webhook this site created with a previous key, if any.
+  if (current.source === "admin" && current.stripe && current.webhookId && current.webhookId !== webhookId) {
+    await current.stripe.webhookEndpoints.del(current.webhookId).catch(() => {});
+  }
+  const cfg = { secretKey: key, webhookSecret, webhookId, savedAt: new Date().toISOString() };
+  await pool.query(
+    "INSERT INTO settings (key,value,updated_at) VALUES ('stripe',$1,now()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()",
+    [encrypt(JSON.stringify(cfg))]
+  );
+  payCache = null;
+  json(res, 200, { ok: true, mode: key.includes("_live_") ? "live" : "test", webhook: !!webhookSecret, note: webhookNote });
+}
+
 function notFound(res) {
   res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
   res.end('<!doctype html><title>Not found</title><p style="font-family:sans-serif;padding:40px">Page not found. <a href="/">Go to Gatherable</a></p>');
@@ -497,6 +595,7 @@ async function handleAdmin(req, res, url) {
   if (req.method === "POST" && !String(req.headers["content-type"] || "").startsWith("application/json"))
     return json(res, 415, { error: "JSON required" });
   if (req.method === "POST" && url.pathname === "/admin/product") return await handleAdminProduct(req, res);
+  if (req.method === "POST" && url.pathname === "/admin/stripe") return await handleAdminStripe(req, res);
   if (req.method === "POST") {
     const b = await readBody(req, 4096);
     if (["new", "contacted", "won", "closed"].includes(b.status) && Number(b.id))
@@ -520,6 +619,22 @@ async function handleAdmin(req, res, url) {
     )
   ).rows;
   const base = siteUrl(req);
+  const pay = await getPayments();
+  const payHtml = `<section><h2>Payments (Stripe)</h2>
+    ${pay.stripe
+      ? `<p class="ok">✓ Connected to Stripe in <b>${pay.mode === "live" ? "LIVE" : "TEST"}</b> mode with the key ending in <b>…${esc(pay.last4)}</b>${pay.source === "env" ? " (set in Render)" : ""}.
+         ${pay.webhookSecret ? "Webhook is set up." : "Webhook not set up yet (sales still work)."}${pay.mode === "test" ? " Test mode: use Stripe test cards; no real money moves." : ""}</p>`
+      : '<p class="warn">Payments are off. Paste your Stripe secret key below to turn them on.</p>'}
+    ${SETTINGS_KEY ? `<form id="stripe-form" class="prod">
+      <label>Stripe secret key${pay.stripe ? " (paste a new one to replace it)" : ""}
+        <input name="secretKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk_live_…" required></label>
+      <details><summary>Advanced: webhook signing secret (optional)</summary>
+        <label>Only needed if automatic setup fails. Stripe → Developers → Webhooks → your endpoint → Signing secret.
+        <input name="webhookSecret" type="password" autocomplete="off" spellcheck="false" placeholder="whsec_…"></label></details>
+      <p class="hint">Find it in Stripe: <b>Developers → API keys → Secret key → Reveal</b>. The key is checked with Stripe, then stored encrypted. It is never shown again on this page.</p>
+      <div><button>Save and connect</button> ${pay.source === "admin" ? '<button type="button" id="stripe-remove" class="danger">Disconnect</button>' : ""} <span class="msg"></span></div>
+    </form>` : '<p class="warn">The server is missing SETTINGS_ENCRYPTION_KEY, so keys can\'t be saved here.</p>'}
+  </section>`;
   const money = (c, cur = "usd") => (c == null ? "—" : (c / 100).toLocaleString("en-US", { style: "currency", currency: cur.toUpperCase() }));
   const productForm = (p) => `<form class="prod" data-id="${p?.id || ""}">
       <div class="g"><label>Title<input name="title" required value="${esc(p?.title)}" placeholder="The Pitch-Ready Checklist"></label>
@@ -531,7 +646,7 @@ async function handleAdmin(req, res, url) {
       <button>${p ? "Save changes" : "Add product"}</button> <span class="msg"></span>
     </form>`;
   const shopHtml = `<section><h2>Digital products</h2>
-    ${stripe ? "" : '<p class="warn">Payments are off until STRIPE_SECRET_KEY is added in Render. You can still set up products.</p>'}
+    ${pay.stripe ? "" : '<p class="warn">Products stay hidden on the website until Stripe is connected above.</p>'}
     ${products.map(productForm).join("")}
     <details${products.length ? "" : " open"}><summary>+ Add a product</summary>${productForm(null)}</details>
     <h3>Sales (${orders.length})</h3>
@@ -571,16 +686,25 @@ h1{font-size:1.5rem}.lead{background:#fff;border:1px solid #D5E2E4;border-radius
 .prod{border:1px solid #D5E2E4;border-radius:10px;padding:14px;margin:12px 0;display:grid;gap:10px}.prod .g{display:grid;grid-template-columns:2fr 1fr 1.4fr 1.2fr;gap:10px;align-items:end}
 .prod label{display:grid;gap:4px;font-size:.85rem;font-weight:600}.prod input,.prod textarea{font:inherit;font-weight:400;padding:7px 9px;border:1px solid #CBD6D5;border-radius:7px}
 .prod .chk{display:flex;gap:8px;align-items:center}.prod .chk input{width:auto}.prod button,.copy{font:inherit;font-weight:600;background:#2A919B;color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;justify-self:start}
-.copy{background:#13468B;padding:5px 10px;font-size:.85rem}.warn{background:#fff6e0;border:1px solid #f0d58a;padding:8px 12px;border-radius:8px}
+.copy{background:#13468B;padding:5px 10px;font-size:.85rem}.prod .danger{background:#b42318}.ok{background:#e5f4e4;border:1px solid #b9dfb6;padding:8px 12px;border-radius:8px}
+.hint{font-size:.85rem;color:#526276;margin:0}details summary{cursor:pointer;font-size:.9rem;color:#13468B}.warn{background:#fff6e0;border:1px solid #f0d58a;padding:8px 12px;border-radius:8px}
 table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:8px 6px;border-top:1px solid #E4EAE9;vertical-align:top}
 @media(max-width:700px){.prod .g{grid-template-columns:1fr 1fr}}</style></head>
 <body><main><nav class="tabs"><a href="#leads">Leads</a><a href="#shop">Digital products &amp; sales</a></nav>
-<div id="shop">${shopHtml}</div>
+<div id="shop">${payHtml}${shopHtml}</div>
 <h1 id="leads">Leads (${leads.length})</h1>${rows || "<p>No leads yet.</p>"}</main>
 <script>
 document.querySelectorAll('select[data-id]').forEach(s=>s.addEventListener('change',()=>fetch('/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:s.dataset.id,status:s.value})})));
+const sf=document.getElementById('stripe-form');
+if(sf){sf.addEventListener('submit',async e=>{e.preventDefault();const m=sf.querySelector('.msg'),btn=sf.querySelector('button');m.textContent='Checking with Stripe…';btn.disabled=true;
+  const r=await fetch('/admin/stripe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secretKey:sf.elements.secretKey.value.trim(),webhookSecret:sf.elements.webhookSecret.value.trim()})});
+  const d=await r.json().catch(()=>({}));btn.disabled=false;
+  if(r.ok){m.textContent='Connected ('+d.mode+' mode). '+(d.note||'');setTimeout(()=>location.reload(),d.note?4000:900)}else m.textContent=d.error||'Could not save';});
+ const rm=document.getElementById('stripe-remove');
+ if(rm)rm.addEventListener('click',async()=>{if(!confirm('Disconnect Stripe? Products will be hidden until a key is added again.'))return;
+  await fetch('/admin/stripe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove'})});location.reload();});}
 document.querySelectorAll('.copy').forEach(b=>b.addEventListener('click',()=>{navigator.clipboard.writeText(b.dataset.link);b.textContent='Copied'}));
-document.querySelectorAll('form.prod').forEach(f=>f.addEventListener('submit',async e=>{
+document.querySelectorAll('form.prod:not(#stripe-form)').forEach(f=>f.addEventListener('submit',async e=>{
   e.preventDefault();const m=f.querySelector('.msg'),btn=f.querySelector('button');m.textContent='Saving…';btn.disabled=true;
   const el=f.elements;const body={id:f.dataset.id||null,title:el.title.value,slug:el.slug.value,price:el.price.value,description:el.description.value,active:el.active.checked};
   const file=el.file.files[0];
@@ -628,7 +752,7 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
   try {
-    if (url.pathname === "/api/health") return json(res, 200, { ok: true, db: !!pool, ai: !!anthropic, payments: !!stripe });
+    if (url.pathname === "/api/health") return json(res, 200, { ok: true, db: !!pool, ai: !!anthropic, payments: !!(await getPayments()).stripe });
     if (url.pathname === "/api/intake" && req.method === "POST") return await handleIntake(req, res);
     if (url.pathname === "/api/review" && req.method === "POST") return await handleReview(req, res);
     if (url.pathname === "/api/products" && req.method === "GET") return await handleProducts(req, res);
@@ -636,7 +760,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/order" && req.method === "GET") return await handleOrderStatus(req, res, url);
     if (url.pathname === "/api/stripe-webhook" && req.method === "POST") return await handleStripeWebhook(req, res);
     if (url.pathname.startsWith("/download/") && req.method === "GET") return await handleDownload(req, res, url.pathname.slice(10));
-    if (url.pathname === "/admin" || url.pathname === "/admin/product") return await handleAdmin(req, res, url);
+    if (url.pathname === "/admin" || url.pathname === "/admin/product" || url.pathname === "/admin/stripe") return await handleAdmin(req, res, url);
     if (req.method === "GET" && (await serveStatic(res, url.pathname))) return;
     notFound(res);
   } catch (e) {
