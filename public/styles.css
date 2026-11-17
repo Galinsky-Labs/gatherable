@@ -262,3 +262,25 @@ legend{font:600 1.35rem/1.2 var(--serif);margin-bottom:18px;padding:0}
 @media (max-width:860px){.buy-grid{grid-template-columns:1fr;gap:28px}}
 .buy-cards{display:grid;gap:18px}
 .buy-desc{color:var(--muted);font-size:.95rem;margin:4px 0 0}
+
+/* legal pages */
+.legal-page{padding:56px 0 80px}
+.legal-page .wrap{max-width:760px}
+.legal-page h1{font-size:clamp(2rem,4vw,2.8rem)}
+.legal-page h2{font-size:1.35rem;margin-top:34px}
+.legal-page .updated{color:var(--muted);font-size:.92rem}
+.legal-page li{margin-bottom:8px}
+.legal-links a{color:var(--aqua)}
+
+/* online booking */
+.book-now{background:var(--mist);border-radius:12px;padding:16px 18px;margin:22px 0 0}
+.book-now p{margin:0 0 10px;font-weight:600}
+.rec-book{margin:6px 0 14px}
+.book-dialog{width:min(920px,96vw);height:min(760px,92vh);padding:0;border:0;border-radius:16px;overflow:hidden;box-shadow:0 30px 80px rgba(20,41,74,.35)}
+.book-dialog::backdrop{background:rgba(20,41,74,.55)}
+.book-dialog[open]{display:flex;flex-direction:column}
+.book-head{display:flex;align-items:center;gap:14px;padding:12px 16px;border-bottom:1px solid var(--line)}
+.book-head b{flex:1;font-family:var(--serif);font-size:1.1rem}
+.book-tab{font-size:.88rem}
+.book-x{border:0;background:none;font-size:1.7rem;line-height:1;cursor:pointer;color:var(--navy)}
+.book-dialog iframe{flex:1;width:100%;border:0}

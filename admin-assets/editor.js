@@ -27,7 +27,7 @@
 
   // Show everything that is normally hidden or collapsed, so all text can be reached.
   document.querySelectorAll("details").forEach(function (d) { d.open = true; });
-  document.querySelectorAll("#checklist[hidden]").forEach(function (s) { s.hidden = false; });
+  document.querySelectorAll("#checklist[hidden],[data-book-wrap][hidden]").forEach(function (s) { s.hidden = false; });
 
   var els = document.querySelectorAll("[data-edit]");
   els.forEach(function (el) {
@@ -56,6 +56,62 @@
     });
   });
 
+  // ---- pictures: click to replace ----
+  var picker = document.createElement("input");
+  picker.type = "file"; picker.accept = "image/jpeg,image/png,image/webp"; picker.style.display = "none";
+  document.body.appendChild(picker);
+  var currentImg = null;
+  var imgs = document.querySelectorAll("img[data-edit-img]");
+  imgs.forEach(function (img) {
+    img.classList.add("ge-img");
+    img.title = "Click to change this picture";
+    img.dataset.origSrc = img.getAttribute("src");
+    img.dataset.origAlt = img.getAttribute("alt") || "";
+    img.addEventListener("click", function (e) {
+      e.preventDefault(); e.stopPropagation();
+      currentImg = img; picker.value = ""; picker.click();
+    });
+  });
+  picker.addEventListener("change", function () {
+    var file = picker.files[0], img = currentImg;
+    if (!file || !img) return;
+    if (file.size > 25 * 1024 * 1024) { alert("That file is very large. Please choose a picture under 25 MB."); return; }
+    msg.textContent = "Preparing picture…";
+    var keepPng = file.type === "image/png" && /\.png$/i.test(img.dataset.origSrc); // logos keep transparency
+    var maxSide = img.dataset.editImg === "logo" ? 800 : 1800;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var im = new Image();
+      im.onload = function () {
+        var scale = Math.min(1, maxSide / Math.max(im.naturalWidth, im.naturalHeight));
+        var w = Math.round(im.naturalWidth * scale), h = Math.round(im.naturalHeight * scale);
+        var c = document.createElement("canvas"); c.width = w; c.height = h;
+        c.getContext("2d").drawImage(im, 0, 0, w, h);
+        var mime = keepPng ? "image/png" : "image/webp";
+        var data = c.toDataURL(mime, 0.82);
+        if (!keepPng && data.indexOf("data:image/webp") !== 0) { mime = "image/jpeg"; data = c.toDataURL(mime, 0.85); }
+        msg.textContent = "Uploading picture…";
+        fetch("/admin/media", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mime: mime, data: data.split(",")[1], w: w, h: h }) })
+          .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error || "Upload failed"); return d; }); })
+          .then(function (d) {
+            var alt = prompt("Describe the picture in a few words (helps Google and people using screen readers):", img.getAttribute("alt") || "");
+            if (alt === null) alt = img.getAttribute("alt") || "";
+            var k = "img:" + img.dataset.editImg;
+            document.querySelectorAll('img[data-edit-img="' + img.dataset.editImg + '"]').forEach(function (o) { o.src = d.src; o.alt = alt; });
+            img.classList.add("ge-changed");
+            dirty[k] = { src: d.src, alt: alt, w: w, h: h };
+            update();
+            msg.textContent = "Picture ready. Click Save changes to put it on the live site.";
+          })
+          .catch(function (x) { msg.textContent = x.message; });
+      };
+      im.onerror = function () { msg.textContent = "That file couldn't be read as a picture."; };
+      im.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
   // While editing, links and buttons don't navigate or submit.
   document.addEventListener("click", function (e) {
     if (e.target.closest("#ge-bar")) return;
@@ -73,6 +129,7 @@
 
   undoBtn.addEventListener("click", function () {
     els.forEach(function (el) { if (dirty[el.dataset.edit] != null) { el.innerHTML = el.dataset.orig; el.classList.remove("ge-changed"); } });
+    imgs.forEach(function (img) { if (dirty["img:" + img.dataset.editImg]) { img.src = img.dataset.origSrc; img.alt = img.dataset.origAlt; img.classList.remove("ge-changed"); } });
     dirty = {}; update();
   });
 
@@ -82,6 +139,7 @@
       .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error || "Could not save"); return d; }); })
       .then(function () {
         els.forEach(function (el) { el.dataset.orig = el.innerHTML; el.classList.remove("ge-changed"); });
+        imgs.forEach(function (img) { img.dataset.origSrc = img.getAttribute("src"); img.dataset.origAlt = img.getAttribute("alt") || ""; img.classList.remove("ge-changed"); });
         dirty = {}; update(); msg.textContent = "Saved. The live site is updated.";
       })
       .catch(function (x) { msg.textContent = x.message; saveBtn.disabled = false; });

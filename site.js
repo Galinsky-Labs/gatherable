@@ -11,12 +11,41 @@ export const PAGES = {
   "/": { file: "index.html", label: "Home page", indexed: true },
   "/pitch-check": { file: "pitch-check.html", label: "Pitch Check page", indexed: true },
   "/thank-you": { file: "thank-you.html", label: "Thank-you page (after purchase)", indexed: false },
+  "/privacy": { file: "privacy.html", label: "Privacy policy", indexed: true, legal: "privacy" },
+  "/terms": { file: "terms.html", label: "Terms of use", indexed: true, legal: "terms" },
 };
 
 export function createSite({ pool, publicDir, canonicalHost }) {
   const baseUrl = () => (canonicalHost ? `https://${canonicalHost}` : "");
   let contentCache = null; // { "/": { k1: html } }
   let seoCache = null;
+  const settingCache = new Map();
+
+  async function getSetting(key, fallback) {
+    if (settingCache.has(key)) return settingCache.get(key);
+    let v = fallback;
+    if (pool) {
+      try {
+        const r = await pool.query("SELECT value FROM settings WHERE key=$1", [key]);
+        if (r.rows[0]) v = { ...fallback, ...JSON.parse(r.rows[0].value) };
+      } catch {}
+    }
+    settingCache.set(key, v);
+    return v;
+  }
+  async function setSetting(key, value) {
+    await pool.query(
+      "INSERT INTO settings (key,value,updated_at) VALUES ($1,$2,now()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()",
+      [key, JSON.stringify(value)]
+    );
+    settingCache.delete(key);
+  }
+  const getLegal = () => getSetting("legal", { privacy: false, terms: false });
+  const getBooking = () => getSetting("booking", { url: "", provider: "", live: false });
+  async function isPublished(pagePath) {
+    const legal = PAGES[pagePath]?.legal;
+    return !legal || !!(await getLegal())[legal];
+  }
 
   async function getContent() {
     if (contentCache) return contentCache;
@@ -62,7 +91,10 @@ export function createSite({ pool, publicDir, canonicalHost }) {
   async function originals(pagePath) {
     const root = await loadTemplate(pagePath);
     const out = {};
-    if (root) for (const el of root.querySelectorAll("[data-edit]")) out[el.getAttribute("data-edit")] ??= el.innerHTML.trim();
+    if (!root) return out;
+    for (const el of root.querySelectorAll("[data-edit]")) out[el.getAttribute("data-edit")] ??= el.innerHTML.trim();
+    for (const img of root.querySelectorAll("img[data-edit-img]"))
+      out["img:" + img.getAttribute("data-edit-img")] ??= JSON.stringify({ src: img.getAttribute("src"), alt: img.getAttribute("alt") || "" });
     return out;
   }
 
@@ -78,6 +110,7 @@ export function createSite({ pool, publicDir, canonicalHost }) {
 
   // Returns the final HTML for a page (edits + SEO applied); editMode adds the in-page editor.
   async function render(pagePath, { editorHtml } = {}) {
+    if (!editorHtml && !(await isPublished(pagePath))) return null;
     const root = await loadTemplate(pagePath);
     if (!root) return null;
     const content = (await getContent())[pagePath] || {};
@@ -85,6 +118,25 @@ export function createSite({ pool, publicDir, canonicalHost }) {
       const html = content[el.getAttribute("data-edit")];
       if (html != null) el.set_content(html);
     }
+    // Replaced pictures
+    for (const img of root.querySelectorAll("img[data-edit-img]")) {
+      const k = "img:" + img.getAttribute("data-edit-img");
+      const raw = content[k] ?? (await getContent())["*"]?.[k]; // "*" = shared across pages (the logo)
+      if (!raw) continue;
+      try {
+        const v = JSON.parse(raw);
+        const old = img.getAttribute("src");
+        if (v.src) img.setAttribute("src", v.src);
+        if (v.alt != null) img.setAttribute("alt", v.alt);
+        if (v.w && v.h) { img.setAttribute("width", String(v.w)); img.setAttribute("height", String(v.h)); }
+        for (const l of root.querySelectorAll('link[rel="preload"][as="image"]')) if (l.getAttribute("href") === old) l.setAttribute("href", v.src);
+      } catch {}
+    }
+    // Footer links to published legal pages
+    const legal = await getLegal();
+    const links = [legal.privacy && '<a href="/privacy">Privacy</a>', legal.terms && '<a href="/terms">Terms</a>'].filter(Boolean);
+    const foot = root.querySelector("footer .wrap");
+    if (foot && links.length) foot.insertAdjacentHTML("beforeend", `<span class="legal-links">${links.join(" · ")}</span>`);
 
     const head = root.querySelector("head");
     const seo = await getSeo();
@@ -112,6 +164,9 @@ export function createSite({ pool, publicDir, canonicalHost }) {
     if (seo.bing) setMeta(head, "name", "msvalidate.01", seo.bing);
 
     if (pagePath === "/") head.insertAdjacentHTML("beforeend", structuredData(root));
+    const booking = await getBooking();
+    if (booking.live && booking.url)
+      setMeta(head, "name", "gatherable-booking", booking.url);
     if (seo.ga4 && !editorHtml)
       head.insertAdjacentHTML(
         "beforeend",
@@ -167,8 +222,9 @@ export function createSite({ pool, publicDir, canonicalHost }) {
         if (r.rows[0]?.t) last = new Date(r.rows[0].t).toISOString().slice(0, 10);
       } catch {}
     }
-    const urls = Object.entries(PAGES)
-      .filter(([, p]) => p.indexed)
+    const pub = [];
+    for (const [p, info] of Object.entries(PAGES)) if (info.indexed && (await isPublished(p))) pub.push([p, info]);
+    const urls = pub
       .map(([p]) => `  <url><loc>${baseUrl()}${p}</loc><lastmod>${last}</lastmod><priority>${p === "/" ? "1.0" : "0.8"}</priority></url>`);
     return `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.join("\n")}\n</urlset>\n`;
   }
@@ -178,7 +234,7 @@ export function createSite({ pool, publicDir, canonicalHost }) {
     const seo = await getSeo();
     const out = [];
     for (const [p, info] of Object.entries(PAGES)) {
-      if (!info.indexed) continue;
+      if (!info.indexed || !(await isPublished(p))) continue;
       const root = parse(await render(p), PARSE_OPTS);
       const title = root.querySelector("title")?.textContent.trim() || "";
       const desc = root.querySelector('meta[name="description"]')?.getAttribute("content") || "";
@@ -212,6 +268,11 @@ export function createSite({ pool, publicDir, canonicalHost }) {
   return {
     render,
     originals,
+    getSetting,
+    setSetting,
+    getLegal,
+    getBooking,
+    isPublished,
     getSeo,
     saveSeo,
     robots,

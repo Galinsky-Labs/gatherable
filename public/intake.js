@@ -132,6 +132,10 @@
         document.getElementById("rec-note").textContent = rec.note || "";
         document.getElementById("rec-extra").hidden = val("role") !== "agency";
         document.getElementById("rec-buy").hidden = document.getElementById("checklist").hidden;
+        window.__gatherableLead = { name: name, email: email };
+        var hasBooking = !!document.querySelector('meta[name="gatherable-booking"]');
+        document.getElementById("rec-book").hidden = !hasBooking;
+        if (hasBooking && window.gatherableOpenBooking) setTimeout(function () { window.gatherableOpenBooking(); }, 900);
         var done = document.getElementById("intake-done"); done.hidden = false; done.focus();
       })
       .catch(function (x) {

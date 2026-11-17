@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import { parse } from "node-html-parser";
 
-const PAGES = ["public/index.html", "public/pitch-check.html", "public/thank-you.html"];
+const PAGES = ["public/index.html", "public/pitch-check.html", "public/thank-you.html", "public/privacy.html", "public/terms.html"];
 const CANDIDATES =
   "h1,h2,h3,h4,p,li,summary,legend,td,th,blockquote,.eyebrow,a.btn,.stat b,.stat span,.contact-info strong";
 const SKIP_INSIDE = "script,style,noscript,form,select,.progress,.hp,a.logo,.side,#pc-result,#buy-cards";
@@ -34,6 +34,15 @@ for (const file of PAGES) {
     } else el.setAttribute("data-edit", "k" + ++max);
     added++;
   }
+  // Pictures get their own keys (data-edit-img="iN") so they can be replaced from the editor.
+  let imax = 0;
+  for (const el of root.querySelectorAll("img[data-edit-img]")) imax = Math.max(imax, Number(el.getAttribute("data-edit-img").slice(1)) || 0);
+  let imgs = 0;
+  for (const img of root.querySelectorAll("img")) {
+    if (img.getAttribute("data-edit-img") || img.getAttribute("src")?.startsWith("data:")) continue;
+    img.setAttribute("data-edit-img", "i" + ++imax);
+    imgs++;
+  }
   fs.writeFileSync(file, root.toString());
-  console.log(file, "added", added, "max key", max);
+  console.log(file, "added", added, "text keys (max", max + "),", imgs, "picture keys");
 }

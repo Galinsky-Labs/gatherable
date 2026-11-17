@@ -94,6 +94,24 @@ async function migrate() {
       download_count    INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS orders_created_idx ON orders (created_at DESC);
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS follow_up_at DATE;
+    ALTER TABLE leads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+    CREATE TABLE IF NOT EXISTS lead_notes (
+      id         BIGSERIAL PRIMARY KEY,
+      lead_id    BIGINT NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      body       TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS lead_notes_lead_idx ON lead_notes (lead_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS media (
+      id         TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      mime       TEXT NOT NULL,
+      width      INTEGER,
+      height     INTEGER,
+      bytes      INTEGER NOT NULL,
+      data       BYTEA NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS content (
       page       TEXT NOT NULL,
       key        TEXT NOT NULL,
@@ -662,7 +680,9 @@ display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:10px 16px;b
 body{padding-top:58px!important}header{top:58px!important}.track{animation:none!important}
 .ge-editable{outline:1px dashed rgba(42,145,155,.55);outline-offset:2px;border-radius:2px;cursor:text}
 .ge-editable:hover{outline:2px dashed #2A919B}.ge-editable:focus{outline:2px solid #2A919B;background:rgba(168,205,206,.18)}
-.ge-changed{background:rgba(240,213,138,.35)!important}`;
+.ge-changed{background:rgba(240,213,138,.35)!important}
+.ge-img{outline:2px dashed rgba(42,145,155,.7);outline-offset:-2px;cursor:pointer!important;transition:filter .15s}.ge-img:hover{filter:brightness(.85);outline:3px solid #2A919B}
+img.ge-changed{outline:3px solid #e0a100}`;
 
 async function handleAdminEdit(req, res, url) {
   const page = url.searchParams.get("page") || "/";
@@ -670,7 +690,7 @@ async function handleAdminEdit(req, res, url) {
   const labels = Object.fromEntries(Object.entries(PAGES).map(([p, v]) => [p, v.label]));
   const editorHtml = `<style>${EDITOR_CSS}</style>
 <div id="ge-bar" role="toolbar" aria-label="Website editor"><b>✎ Editing</b><select id="ge-page" aria-label="Page"></select>
-<span class="tip">Click any outlined text and type. Ctrl/⌘+B for bold. Shift+Enter for a new line.</span>
+<span class="tip">Click any outlined text and type, or click a picture to replace it. Ctrl/⌘+B for bold. Shift+Enter for a new line.</span>
 <span id="ge-count"></span><button type="button" id="ge-undo">Undo unsaved</button><button type="button" id="ge-save">Save changes</button>
 <a href="/admin#content">Done</a><span id="ge-msg" role="status"></span></div>
 <script>window.__EDIT_PAGE__=${JSON.stringify(page)};window.__EDIT_PAGES__=${JSON.stringify(labels).replace(/</g, "\\u003c")};</script>
@@ -686,14 +706,30 @@ async function handleAdminContent(req, res) {
   const originals = await site.originals(page);
   if (b.revert) {
     const key = String(b.revert);
-    await pool.query("DELETE FROM content WHERE page=$1 AND key=$2", [page, key]);
-    await pool.query("INSERT INTO content_history (page,key,html) VALUES ($1,$2,NULL)", [page, key]);
+    const pg = String(b.revertPage || page);
+    await pool.query("DELETE FROM content WHERE page=$1 AND key=$2", [pg, key]);
+    await pool.query("INSERT INTO content_history (page,key,html) VALUES ($1,$2,NULL)", [pg, key]);
     site.invalidateContent();
     return json(res, 200, { ok: true });
   }
   const changes = Object.entries(b.changes || {}).slice(0, 300);
   for (const [key, raw] of changes) {
     if (!(key in originals)) continue;
+    if (key.startsWith("img:")) {
+      const v = typeof raw === "object" && raw ? raw : {};
+      const src = String(v.src || "");
+      if (!/^\/(media\/[a-f0-9]{24}\.(webp|jpg|png)|img\/[\w.-]+)$/.test(src)) return json(res, 400, { error: "That picture couldn't be saved. Try uploading it again." });
+      const val = JSON.stringify({ src, alt: clean(v.alt, 200), w: Math.min(Number(v.w) || 0, 10000), h: Math.min(Number(v.h) || 0, 10000) });
+      const pg = key === "img:logo" ? "*" : page;
+      if (val === JSON.stringify({ ...JSON.parse(originals[key]), w: 0, h: 0 })) await pool.query("DELETE FROM content WHERE page=$1 AND key=$2", [pg, key]);
+      else
+        await pool.query(
+          "INSERT INTO content (page,key,html,updated_at) VALUES ($1,$2,$3,now()) ON CONFLICT (page,key) DO UPDATE SET html=EXCLUDED.html, updated_at=now()",
+          [pg, key, val]
+        );
+      await pool.query("INSERT INTO content_history (page,key,html) VALUES ($1,$2,$3)", [pg, key, val]);
+      continue;
+    }
     const html = sanitizeInline(raw);
     if (!html) return json(res, 400, { error: "A piece of text can't be left empty. Undo it or type something." });
     if (html === sanitizeInline(originals[key])) await pool.query("DELETE FROM content WHERE page=$1 AND key=$2", [page, key]);
@@ -706,6 +742,111 @@ async function handleAdminContent(req, res) {
   }
   site.invalidateContent();
   json(res, 200, { ok: true, saved: changes.length });
+}
+
+// Pictures uploaded from the editor (already resized in the browser) are stored in Postgres.
+async function handleAdminMedia(req, res) {
+  const b = await readBody(req, 6 * 1024 * 1024);
+  const types = { "image/webp": "webp", "image/jpeg": "jpg", "image/png": "png" };
+  const ext = types[b.mime];
+  if (!ext) return json(res, 400, { error: "Please choose a JPG, PNG or WebP picture." });
+  const data = Buffer.from(String(b.data || ""), "base64");
+  if (data.length < 100 || data.length > 4 * 1024 * 1024) return json(res, 413, { error: "That picture is too large. Please use one under 4 MB." });
+  const id = crypto.randomBytes(12).toString("hex");
+  await pool.query("INSERT INTO media (id,mime,width,height,bytes,data) VALUES ($1,$2,$3,$4,$5,$6)", [
+    id, b.mime, Number(b.w) || null, Number(b.h) || null, data.length, data,
+  ]);
+  json(res, 200, { ok: true, src: `/media/${id}.${ext}` });
+}
+
+async function serveMedia(req, res, name) {
+  const m = /^([a-f0-9]{24})\.(webp|jpg|png)$/.exec(name);
+  if (!m || !pool) return notFound(res);
+  const r = await pool.query("SELECT mime, data FROM media WHERE id=$1", [m[1]]);
+  if (!r.rows[0]) return notFound(res);
+  res.writeHead(200, { "Content-Type": r.rows[0].mime, "Cache-Control": "public, max-age=31536000, immutable" });
+  res.end(r.rows[0].data);
+}
+
+async function handleAdminLegal(req, res) {
+  const b = await readBody(req, 4096);
+  const legal = { ...(await site.getLegal()) };
+  for (const k of ["privacy", "terms"]) if (typeof b[k] === "boolean") legal[k] = b[k];
+  await site.setSetting("legal", legal);
+  json(res, 200, { ok: true, legal });
+}
+
+// Online booking: a Cal.com or Calendly scheduling link, shown on the site only when switched on.
+function bookingProvider(u) {
+  try {
+    const url = new URL(u);
+    if (url.protocol !== "https:") return null;
+    if (/^(www\.)?calendly\.com$/.test(url.hostname)) return "calendly";
+    if (/^(app\.)?cal\.com$/.test(url.hostname) || /^[a-z0-9-]+\.cal\.com$/.test(url.hostname)) return "calcom";
+  } catch {}
+  return null;
+}
+async function handleAdminBooking(req, res) {
+  const b = await readBody(req, 4096);
+  const cur = await site.getBooking();
+  const next = { ...cur };
+  if (typeof b.url === "string") {
+    const url = b.url.trim();
+    if (url) {
+      const provider = bookingProvider(url);
+      if (!provider) return json(res, 400, { error: "Paste your Cal.com or Calendly booking link, for example https://calendly.com/your-name/30min" });
+      const u = new URL(url);
+      if (u.pathname.split("/").filter(Boolean).length < 1) return json(res, 400, { error: "That's the Calendly or Cal.com home page. Paste the link to your own booking page." });
+      Object.assign(next, { url: u.origin + u.pathname.replace(/\/$/, ""), provider });
+    } else Object.assign(next, { url: "", provider: "", live: false });
+  }
+  if (typeof b.live === "boolean") {
+    if (b.live && !next.url) return json(res, 400, { error: "Add your booking link first." });
+    next.live = b.live;
+  }
+  await site.setSetting("booking", next);
+  json(res, 200, { ok: true, booking: next });
+}
+
+const LEAD_STATUSES = { new: "New", contacted: "Contacted", meeting: "Meeting booked", proposal: "Proposal sent", won: "Won", lost: "Lost", closed: "Closed" };
+async function handleAdminLead(req, res) {
+  const b = await readBody(req, 16 * 1024);
+  const id = Number(b.id);
+  if (!id) return json(res, 400, { error: "Missing lead." });
+  if (b.status !== undefined) {
+    if (!LEAD_STATUSES[b.status]) return json(res, 400, { error: "Unknown status." });
+    await pool.query("UPDATE leads SET status=$1, updated_at=now() WHERE id=$2", [b.status, id]);
+  }
+  if (b.follow_up_at !== undefined) {
+    const d = b.follow_up_at ? String(b.follow_up_at) : null;
+    if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) return json(res, 400, { error: "Invalid date." });
+    await pool.query("UPDATE leads SET follow_up_at=$1, updated_at=now() WHERE id=$2", [d, id]);
+  }
+  let note = null;
+  if (b.note) {
+    const body = String(b.note).trim().slice(0, 4000);
+    if (body) note = (await pool.query("INSERT INTO lead_notes (lead_id, body) VALUES ($1,$2) RETURNING id, created_at, body", [id, body])).rows[0];
+    await pool.query("UPDATE leads SET updated_at=now() WHERE id=$1", [id]);
+  }
+  if (b.deleteNote) await pool.query("DELETE FROM lead_notes WHERE id=$1 AND lead_id=$2", [Number(b.deleteNote), id]);
+  json(res, 200, { ok: true, note });
+}
+
+async function handleLeadsCsv(req, res) {
+  const r = await pool.query(
+    `SELECT l.id, l.created_at, l.source, l.name, l.email, l.company, l.phone, l.role, l.topic, l.status, l.follow_up_at, l.message, l.answers,
+            (SELECT string_agg(to_char(n.created_at,'YYYY-MM-DD') || ': ' || n.body, ' | ' ORDER BY n.created_at) FROM lead_notes n WHERE n.lead_id=l.id) AS notes
+       FROM leads l ORDER BY l.created_at DESC`
+  );
+  const cols = ["id", "created_at", "source", "name", "email", "company", "phone", "role", "topic", "status", "follow_up_at", "message", "answers", "notes"];
+  const cell = (v) => {
+    let s = v == null ? "" : v instanceof Date ? v.toISOString() : typeof v === "object" ? JSON.stringify(v) : String(v);
+    if (/^[=+\-@]/.test(s)) s = "'" + s; // stop spreadsheet formula injection
+    return '"' + s.replace(/"/g, '""') + '"';
+  };
+  const csv = [cols.join(","), ...r.rows.map((row) => cols.map((c) => cell(row[c])).join(","))].join("\r\n");
+  res.writeHead(200, { "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="gatherable-leads-${new Date().toISOString().slice(0, 10)}.csv"`, "Cache-Control": "no-store" });
+  res.end("\ufeff" + csv);
 }
 
 async function handleAdminSeo(req, res) {
@@ -740,10 +881,15 @@ async function handleAdmin(req, res, url) {
   if (req.method === "POST" && url.pathname === "/admin/password") return await handleAdminPassword(req, res);
   if (req.method === "POST" && url.pathname === "/admin/content") return await handleAdminContent(req, res);
   if (req.method === "POST" && url.pathname === "/admin/seo") return await handleAdminSeo(req, res);
+  if (req.method === "POST" && url.pathname === "/admin/media") return await handleAdminMedia(req, res);
+  if (req.method === "POST" && url.pathname === "/admin/legal") return await handleAdminLegal(req, res);
+  if (req.method === "POST" && url.pathname === "/admin/booking") return await handleAdminBooking(req, res);
+  if (req.method === "POST" && url.pathname === "/admin/lead") return await handleAdminLead(req, res);
+  if (req.method === "GET" && url.pathname === "/admin/leads.csv") return await handleLeadsCsv(req, res);
   if (req.method === "GET" && url.pathname === "/admin/edit") return await handleAdminEdit(req, res, url);
   if (req.method === "POST") {
     const b = await readBody(req, 4096);
-    if (["new", "contacted", "won", "closed"].includes(b.status) && Number(b.id))
+    if (LEAD_STATUSES[b.status] && Number(b.id))
       await pool.query("UPDATE leads SET status=$1 WHERE id=$2", [b.status, Number(b.id)]);
     return json(res, 200, { ok: true });
   }
@@ -751,7 +897,7 @@ async function handleAdmin(req, res, url) {
     await pool.query(
       `SELECT l.*, r.doc_type, r.file_name, r.status AS review_status, r.result
          FROM leads l LEFT JOIN reviews r ON r.lead_id=l.id
-        ORDER BY l.created_at DESC LIMIT 200`
+        ORDER BY l.created_at DESC LIMIT 500`
     )
   ).rows;
   const products = (
@@ -766,6 +912,16 @@ async function handleAdmin(req, res, url) {
   const base = siteUrl(req);
   const pay = await getPayments();
   const newLeads = leads.filter((l) => l.status === "new").length;
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const OPEN = ["new", "contacted", "meeting", "proposal"];
+  const ymd = (d) => (d ? (d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10)) : "");
+  const isDue = (l) => OPEN.includes(l.status) && l.follow_up_at && ymd(l.follow_up_at) <= today;
+  const dueCount = leads.filter(isDue).length;
+  const notesBy = {};
+  if (leads.length)
+    for (const n of (await pool.query("SELECT id, lead_id, created_at, body FROM lead_notes WHERE lead_id = ANY($1) ORDER BY created_at DESC", [leads.map((l) => l.id)])).rows)
+      (notesBy[n.lead_id] ||= []).push(n);
+  const fmtDate = (d) => new Date(d).toLocaleString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
   const live = products.filter((p) => p.active).length;
   const payHtml = `<section id="payments"><h2>Payments (Stripe)</h2>
     ${pay.stripe
@@ -792,14 +948,18 @@ async function handleAdmin(req, res, url) {
       <label>File ${p?.file_name ? `(current: ${esc(p.file_name)}, ${Math.round((p.file_bytes || 0) / 1024)} KB — choose a file only to replace it)` : "(PDF recommended, max 10 MB)"}<input name="file" type="file"></label>
       <button>${p ? "Save changes" : "Add product"}</button> <span class="msg"></span>
     </form>`;
+  const noteHtml = (n) => `<li data-note="${n.id}"><span class="when">${esc(fmtDate(n.created_at))}</span> ${esc(n.body).replace(/\n/g, "<br>")} <button type="button" class="del-note" title="Delete note">×</button></li>`;
   const rows = leads
     .map((l) => {
       const brief = l.ai_brief;
       const r = l.result;
-      return `<article class="lead">
+      const due = isDue(l);
+      const text = [l.name, l.email, l.company, l.message, TOPICS[l.topic]].join(" ").toLowerCase();
+      return `<article class="lead${due ? " due" : ""}" data-id="${l.id}" data-status="${esc(l.status)}" data-due="${due ? 1 : 0}" data-text="${esc(text)}">
       <header><div><b>${esc(l.name)}</b> · <a href="mailto:${esc(l.email)}">${esc(l.email)}</a>${l.phone ? " · " + esc(l.phone) : ""}<br>
-      <small>${esc(l.company || "—")} · ${esc(l.role)} · ${esc(l.source === "pitch_check" ? "Pitch Check" : "Contact form")} · ${new Date(l.created_at).toLocaleString("en-US", { timeZone: "America/New_York" })}</small></div>
-      <select data-id="${l.id}">${["new", "contacted", "won", "closed"].map((s) => `<option${s === l.status ? " selected" : ""}>${s}</option>`).join("")}</select></header>
+      <small>${esc(l.company || "—")} · ${esc(l.role)} · ${esc(l.source === "pitch_check" ? "Pitch Check" : "Contact form")} · ${esc(fmtDate(l.created_at))}</small></div>
+      <div class="track-ctl"><label>Status<select class="st">${Object.entries(LEAD_STATUSES).map(([v, t]) => `<option value="${v}"${v === l.status ? " selected" : ""}>${t}</option>`).join("")}</select></label>
+      <label>Follow up${due ? ' <b class="due-tag">due</b>' : ""}<input type="date" class="fu" value="${esc(ymd(l.follow_up_at))}"></label></div></header>
       <p><b>Topic:</b> ${esc(TOPICS[l.topic] || l.topic)}</p>
       ${Object.keys(l.answers || {}).length ? `<p>${Object.entries(l.answers).filter(([, v]) => v).map(([k, v]) => `<b>${esc(k.replace(/_/g, " "))}:</b> ${esc(v)}`).join("<br>")}</p>` : ""}
       ${l.message ? `<p><b>Message:</b> ${esc(l.message)}</p>` : ""}
@@ -807,11 +967,23 @@ async function handleAdmin(req, res, url) {
         <b>Ask in the meeting:</b><ul>${(brief.questions_to_ask || []).map((q) => `<li>${esc(q)}</li>`).join("")}</ul></div>` : ""}
       ${r ? `<div class="brief"><b>Pitch Check: ${esc(l.doc_type)} (${esc(l.file_name)})</b> · score ${esc(r.overall_score)}/100<p>${esc(r.headline)}</p>
         <b>Top fixes:</b><ul>${(r.top_fixes || []).map((f) => `<li>${esc(f.title)}</li>`).join("")}</ul></div>` : l.review_status ? `<p><i>Pitch check status: ${esc(l.review_status)}</i></p>` : ""}
+      <div class="notes"><b>Notes</b><ul>${(notesBy[l.id] || []).map(noteHtml).join("")}</ul>
+        <form class="add-note"><textarea rows="1" placeholder="Add a note: call summary, next step…" aria-label="New note"></textarea><button>Add note</button></form></div>
     </article>`;
     })
     .join("");
-  const leadsHtml = `<section id="leads"><h2>Leads <small>${leads.length} total · ${newLeads} new</small></h2>
-    ${rows || "<p>No leads yet.</p>"}</section>`;
+  const count = (st) => leads.filter((l) => st.includes(l.status)).length;
+  const leadsHtml = `<section id="leads"><h2>Leads <small>${leads.length} total · ${newLeads} new${dueCount ? ` · <b class="due-tag">${dueCount} follow-up${dueCount > 1 ? "s" : ""} due</b>` : ""}</small></h2>
+    <div class="lead-bar"><div class="filters" role="group" aria-label="Filter leads">
+      <button type="button" data-f="all" class="on">All (${leads.length})</button>
+      <button type="button" data-f="new">New (${newLeads})</button>
+      <button type="button" data-f="due">Follow-ups due (${dueCount})</button>
+      <button type="button" data-f="open">In progress (${count(["contacted", "meeting", "proposal"])})</button>
+      <button type="button" data-f="won">Won (${count(["won"])})</button>
+      <button type="button" data-f="closed">Lost / closed (${count(["lost", "closed"])})</button></div>
+      <input type="search" id="lead-search" placeholder="Search name, company, email…" aria-label="Search leads">
+      <a class="csv" href="/admin/leads.csv">Export CSV</a></div>
+    <div id="lead-list">${rows || "<p>No leads yet.</p>"}</div><p id="lead-empty" class="hint" hidden>No leads match.</p></section>`;
   const productsHtml = `<section id="products"><h2>Digital products <small>${live} live of ${products.length}</small></h2>
     ${pay.stripe ? "" : '<p class="warn">Products stay hidden on the website until Stripe is connected in <a href="#payments">Payments</a>.</p>'}
     ${products.map(productForm).join("")}
@@ -830,13 +1002,18 @@ async function handleAdmin(req, res, url) {
   const edits = (await pool.query("SELECT page, key, html, updated_at FROM content ORDER BY updated_at DESC")).rows;
   const origByPage = {};
   for (const p of Object.keys(PAGES)) origByPage[p] = await site.originals(p);
+  origByPage["*"] = origByPage["/"];
+  const showVal = (k, h) => {
+    if (!k.startsWith("img:")) return esc(strip(h));
+    try { const v = JSON.parse(h); return `<img class="thumb" src="${esc(v.src)}" alt=""> ${esc(v.alt || "")}`; } catch { return "Picture"; }
+  };
   const strip = (h) => String(h || "").replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&nbsp;/g, " ").trim();
   const contentHtml = `<section id="content"><h2>Website text <small>${edits.length} edited</small></h2>
-    <p>Change any heading, paragraph, button or list item on the site yourself. Click below, then click the text you want to change and type.</p>
+    <p>Change any heading, paragraph, button, list item or picture on the site yourself. Click below, then click the text or picture you want to change.</p>
     <p><a class="btnlink" href="/admin/edit?page=/">✎ Edit home page</a> <a class="btnlink alt" href="/admin/edit?page=/pitch-check">✎ Edit Pitch Check page</a> <a class="btnlink alt" href="/admin/edit?page=/thank-you">✎ Edit thank-you page</a></p>
     ${edits.length ? `<h3>Your changes</h3><table class="edits"><tr><th>Page</th><th>Originally</th><th>Now</th><th></th></tr>${edits
-      .map((e) => `<tr><td>${esc(PAGES[e.page]?.label || e.page)}</td><td class="was">${esc(strip(origByPage[e.page]?.[e.key]))}</td><td>${esc(strip(e.html))}</td>
-        <td><button type="button" class="revert" data-page="${esc(e.page)}" data-key="${esc(e.key)}">Revert</button></td></tr>`)
+      .map((e) => `<tr><td>${esc(e.page === "*" ? "All pages (logo)" : PAGES[e.page]?.label || e.page)}</td><td class="was">${showVal(e.key, origByPage[e.page]?.[e.key])}</td><td>${showVal(e.key, e.html)}</td>
+        <td><button type="button" class="revert" data-page="${esc(e.page === "*" ? "/" : e.page)}" data-rpage="${esc(e.page)}" data-key="${esc(e.key)}">Revert</button></td></tr>`)
       .join("")}</table>` : '<p class="hint">No changes yet. Everything shows the original text.</p>'}
   </section>`;
   // SEO
@@ -863,6 +1040,25 @@ async function handleAdmin(req, res, url) {
       <div><button>Save SEO settings</button> <span class="msg"></span></div>
     </form>
   </section>`;
+  const legal = await site.getLegal();
+  const legalRow = (k, path, label) => `<div class="legal-row"><div><b>${label}</b> <span class="pill ${legal[k] ? "on" : ""}">${legal[k] ? "Live" : "Draft, not on the site"}</span>
+      <br><small>${legal[k] ? `Linked in the footer of every page: <a href="${path}" target="_blank" rel="noopener">${base}${path}</a>` : "Only you can see it, from here."}</small></div>
+      <div class="legal-actions"><a class="btnlink alt" href="/admin/edit?page=${path}">${legal[k] ? "Edit" : "Preview &amp; edit"}</a>
+      <label class="switch"><input type="checkbox" class="legal-toggle" data-k="${k}"${legal[k] ? " checked" : ""}> <span>Live on website</span></label></div></div>`;
+  const legalHtml = `<section id="legal"><h2>Legal pages</h2>
+    <p>Drafts of a privacy policy and terms of use, written for how this site actually works. Read them, edit anything, and switch each one on when you're happy. <b>Have a lawyer review them before you publish.</b></p>
+    ${legalRow("privacy", "/privacy", "Privacy policy")}${legalRow("terms", "/terms", "Terms of use")}
+    <p class="hint">Points to check in the terms: the refund rule (sales final, with fixes or refunds for faulty files within 14 days) and Connecticut as the governing law.</p></section>`;
+  const booking = await site.getBooking();
+  const bookingHtml = `<section id="booking"><h2>Online booking</h2>
+    ${booking.live ? `<p class="ok">✓ Live. Visitors can pick a time with you on your ${booking.provider === "calendly" ? "Calendly" : "Cal.com"} calendar.</p>` : booking.url ? '<p class="warn">Connected but not live yet. Check the preview, then switch it on.</p>' : '<p class="warn">Not set up. Visitors can still send a request through the contact form.</p>'}
+    <p>Lets visitors book a meeting straight into your calendar. It appears as a <b>"Pick a time now"</b> button by the contact form, and the calendar opens right after someone sends a request, with their name and email filled in.</p>
+    <form id="booking-form" class="prod">
+      <label>Your Cal.com or Calendly booking link<input name="url" type="url" value="${esc(booking.url)}" placeholder="https://calendly.com/your-name/30min"></label>
+      <p class="hint">Calendly: open your event type → <b>Copy link</b>. Cal.com: open your event type → <b>Copy link</b>. Use the link for a single meeting type, such as a 30-minute intro call.</p>
+      <div><button>Save link</button> ${booking.url ? `<a class="btnlink alt" href="${esc(booking.url)}" target="_blank" rel="noopener">Preview calendar ↗</a>` : ""} <span class="msg"></span></div>
+      <label class="switch big"><input type="checkbox" id="booking-live"${booking.live ? " checked" : ""}${booking.url ? "" : " disabled"}> <span>Show online booking on the website</span></label>
+    </form></section>`;
   const passwordHtml = `<section id="password"><h2>Admin password</h2>
     <form id="pw-form" class="prod">
       <label>Current password<input name="current" type="password" autocomplete="current-password" required></label>
@@ -873,10 +1069,12 @@ async function handleAdmin(req, res, url) {
     </form>
   </section>`;
   const nav = [
-    ["leads", "Leads", newLeads ? `<b class="badge">${newLeads}</b>` : ""],
+    ["leads", "Leads", dueCount ? `<b class="badge warnb" title="Follow-ups due">${dueCount}</b>` : newLeads ? `<b class="badge">${newLeads}</b>` : ""],
     ["products", "Products", ""],
     ["sales", "Sales", orders.length ? `<b class="badge muted">${orders.length}</b>` : ""],
     ["content", "Website text", ""],
+    ["booking", "Online booking", booking.live ? "" : '<b class="badge muted">off</b>'],
+    ["legal", "Legal pages", legal.privacy && legal.terms ? "" : '<b class="badge muted">draft</b>'],
     ["seo", "SEO", aud.site.some(([ok]) => ok === false) || aud.pages.some((p) => p.checks.some(([ok]) => ok === false)) ? '<b class="badge warnb">!</b>' : ""],
     ["password", "Password", ""],
     ["payments", "Payments", pay.stripe ? "" : '<b class="badge warnb">off</b>'],
@@ -915,6 +1113,22 @@ fieldset{border:1px solid #D5E2E4;border-radius:10px;padding:12px 14px;margin:0;
 .serp{border:1px solid #E4EAE9;border-radius:8px;padding:10px 12px;font-family:arial,sans-serif;background:#fff}.serp span{display:block}
 .serp .u{color:#202124;font-size:12px}.serp .t{color:#1a0dab;font-size:18px;line-height:1.3;margin:2px 0}.serp .d{color:#4d5156;font-size:13px}
 .cnt{font-weight:400;color:#526276;font-size:.8rem}.cnt.bad{color:#9a5b00}
+.lead-bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 14px}.filters{display:flex;flex-wrap:wrap;gap:6px}
+.filters button{font:inherit;font-size:.85rem;background:#fff;border:1px solid #CBD6D5;border-radius:999px;padding:5px 12px;cursor:pointer}.filters button.on{background:#14294A;color:#fff;border-color:#14294A}
+#lead-search{font:inherit;padding:6px 10px;border:1px solid #CBD6D5;border-radius:8px;flex:1;min-width:180px}.csv{font-size:.88rem}
+.track-ctl{display:flex;gap:10px;flex-wrap:wrap}.track-ctl label{display:grid;gap:2px;font-size:.75rem;font-weight:600;color:#526276}
+.track-ctl input,.track-ctl select{font:inherit;font-size:.9rem;padding:4px 6px;border:1px solid #CBD6D5;border-radius:7px}
+.lead.due{border-left:4px solid #e0a100}.due-tag{background:#fff3cd;color:#8a5a00;border-radius:999px;padding:0 7px;font-size:.75rem}
+.notes{border-top:1px solid #E4EAE9;margin-top:12px;padding-top:10px}.notes ul{list-style:none;padding:0;margin:6px 0}
+.notes li{font-size:.92rem;padding:5px 0;border-bottom:1px dashed #E4EAE9}.notes .when{color:#526276;font-size:.8rem;margin-right:6px}
+.del-note{border:0;background:none;color:#9aa;cursor:pointer;font-size:1rem}.add-note{display:flex;gap:8px;margin-top:6px}
+.add-note textarea{flex:1;font:inherit;font-size:.92rem;padding:6px 8px;border:1px solid #CBD6D5;border-radius:7px;resize:vertical}
+.add-note button{font:inherit;font-weight:600;background:#2A919B;color:#fff;border:0;border-radius:8px;padding:6px 12px;cursor:pointer}
+.legal-row{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;border:1px solid #D5E2E4;border-radius:10px;padding:12px 14px;margin:10px 0}
+.legal-actions{display:flex;gap:12px;align-items:center}.legal-actions .btnlink{margin:0}
+.pill{font-size:.75rem;border-radius:999px;padding:1px 8px;background:#f0efec;color:#526276}.pill.on{background:#e5f4e4;color:#2b6a2f}
+.switch{display:inline-flex!important;gap:8px;align-items:center;font-weight:600;cursor:pointer}.switch input{width:18px;height:18px}.switch.big{margin-top:6px}
+.thumb{width:48px;height:32px;object-fit:cover;border-radius:4px;vertical-align:middle}
 @media(max-width:800px){.layout{grid-template-columns:minmax(0,1fr)}.layout>*{min-width:0}.side{position:sticky;height:auto;display:flex;gap:4px;overflow-x:auto;padding:10px;z-index:5}
 .side .brand,.side .sep,.side .foot{display:none}.side a{white-space:nowrap;margin:0}main{padding:18px 14px}.g2{grid-template-columns:1fr}}
 </style></head>
@@ -922,11 +1136,11 @@ fieldset{border:1px solid #D5E2E4;border-radius:10px;padding:12px 14px;margin:0;
 <nav class="side" aria-label="Admin sections"><div class="brand">Gatherable<small>Admin</small></div>
 ${nav.slice(0, 3).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"><span>${label}</span>${extra}</a>`).join("")}
 <div class="sep">Website</div>
-${nav.slice(3, 5).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"><span>${label}</span>${extra}</a>`).join("")}
+${nav.slice(3, 7).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"><span>${label}</span>${extra}</a>`).join("")}
 <div class="sep">Settings</div>
-${nav.slice(5).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"><span>${label}</span>${extra}</a>`).join("")}
+${nav.slice(7).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"><span>${label}</span>${extra}</a>`).join("")}
 <div class="foot"><a href="/" target="_blank" rel="noopener">View website ↗</a></div></nav>
-<main>${leadsHtml}${productsHtml}${salesHtml}${contentHtml}${seoHtml}${passwordHtml}${payHtml}</main></div>
+<main>${leadsHtml}${productsHtml}${salesHtml}${contentHtml}${bookingHtml}${legalHtml}${seoHtml}${passwordHtml}${payHtml}</main></div>
 <script>
 document.querySelectorAll('select[data-id]').forEach(s=>s.addEventListener('change',()=>fetch('/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:s.dataset.id,status:s.value})})));
 const sf=document.getElementById('stripe-form');
@@ -949,7 +1163,7 @@ document.querySelectorAll('form.prod[data-id]').forEach(f=>f.addEventListener('s
   if(r.ok){m.textContent='Saved';setTimeout(()=>location.reload(),600)}else m.textContent=d.error||'Could not save';
 }));
 document.querySelectorAll('.revert').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('Put back the original text?'))return;b.disabled=true;
-  await fetch('/admin/content',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({page:b.dataset.page,revert:b.dataset.key})});location.reload()}));
+  await fetch('/admin/content',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({page:b.dataset.page,revert:b.dataset.key,revertPage:b.dataset.rpage})});location.reload()}));
 const sfm=document.getElementById('seo-form');
 const lim={title:[30,60],description:[70,160]};
 function cnt(i){const c=i.closest('label').querySelector('.cnt'),[lo,hi]=lim[i.name];const n=i.value.trim().length;c.textContent=n+' characters (aim for '+lo+'–'+hi+')';c.classList.toggle('bad',n<lo||n>hi);
@@ -959,6 +1173,33 @@ sfm.addEventListener('submit',async e=>{e.preventDefault();const m=sfm.querySele
   const pages={};sfm.querySelectorAll('[data-page]').forEach(i=>{(pages[i.dataset.page]??={})[i.name]=i.value});
   const el=sfm.elements;const r=await fetch('/admin/seo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pages,gsc:el.gsc.value.trim(),bing:el.bing.value.trim(),ga4:el.ga4.value.trim()})});
   const d=await r.json().catch(()=>({}));btn.disabled=false;if(r.ok){m.textContent='Saved';setTimeout(()=>location.reload(),700)}else m.textContent=d.error||'Could not save';});
+const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json().then(d=>{if(!r.ok)throw new Error(d.error||'Could not save');return d}));
+// lead tracking
+document.querySelectorAll('article.lead').forEach(card=>{const id=card.dataset.id;
+  card.querySelector('.st').addEventListener('change',e=>{card.dataset.status=e.target.value;post('/admin/lead',{id,status:e.target.value}).catch(x=>alert(x.message))});
+  card.querySelector('.fu').addEventListener('change',e=>post('/admin/lead',{id,follow_up_at:e.target.value||null}).catch(x=>alert(x.message)));
+  const f=card.querySelector('.add-note');f.addEventListener('submit',async e=>{e.preventDefault();const t=f.querySelector('textarea');if(!t.value.trim())return;
+    const d=await post('/admin/lead',{id,note:t.value}).catch(x=>alert(x.message));if(!d||!d.note)return;t.value='';
+    const li=document.createElement('li');li.dataset.note=d.note.id;const w=document.createElement('span');w.className='when';w.textContent='Just now';
+    li.append(w,' '+d.note.body+' ');const x=document.createElement('button');x.type='button';x.className='del-note';x.textContent='×';li.append(x);card.querySelector('.notes ul').prepend(li)});
+  card.querySelector('.notes ul').addEventListener('click',e=>{const x=e.target.closest('.del-note');if(!x||!confirm('Delete this note?'))return;const li=x.closest('li');
+    post('/admin/lead',{id,deleteNote:li.dataset.note}).then(()=>li.remove()).catch(z=>alert(z.message))});});
+let lf='all';const ls=document.getElementById('lead-search');
+function applyLeads(){const q=(ls.value||'').toLowerCase().trim();let n=0;document.querySelectorAll('article.lead').forEach(c=>{const st=c.dataset.status;
+  const ok=(lf==='all'||(lf==='new'&&st==='new')||(lf==='due'&&c.dataset.due==='1')||(lf==='open'&&['contacted','meeting','proposal'].includes(st))||(lf==='won'&&st==='won')||(lf==='closed'&&['lost','closed'].includes(st)))&&(!q||c.dataset.text.includes(q));
+  c.hidden=!ok;if(ok)n++});document.getElementById('lead-empty').hidden=n>0||!document.querySelector('article.lead');}
+document.querySelectorAll('.filters button').forEach(b=>b.addEventListener('click',()=>{lf=b.dataset.f;document.querySelectorAll('.filters button').forEach(x=>x.classList.toggle('on',x===b));applyLeads()}));
+ls.addEventListener('input',applyLeads);
+// legal pages
+document.querySelectorAll('.legal-toggle').forEach(t=>t.addEventListener('change',async()=>{
+  if(t.checked&&!confirm('Publish this page on the website and link it in the footer?')){t.checked=false;return}
+  await post('/admin/legal',{[t.dataset.k]:t.checked}).catch(x=>{alert(x.message);t.checked=!t.checked});location.reload()}));
+// booking
+const bf=document.getElementById('booking-form');
+bf.addEventListener('submit',async e=>{e.preventDefault();const m=bf.querySelector('.msg');m.textContent='Saving…';
+  try{await post('/admin/booking',{url:bf.elements.url.value});m.textContent='Saved';setTimeout(()=>location.reload(),600)}catch(x){m.textContent=x.message}});
+document.getElementById('booking-live').addEventListener('change',async e=>{const m=bf.querySelector('.msg');
+  try{await post('/admin/booking',{live:e.target.checked});m.textContent=e.target.checked?'Booking is live on the website.':'Booking is hidden.';setTimeout(()=>location.reload(),900)}catch(x){m.textContent=x.message;e.target.checked=!e.target.checked}});
 const pf=document.getElementById('pw-form');
 pf.addEventListener('submit',async e=>{e.preventDefault();const m=pf.querySelector('.msg'),btn=pf.querySelector('button'),el=pf.elements;
   if(el.next.value!==el.confirm.value){m.textContent='The new passwords don\\'t match.';return}
@@ -998,6 +1239,7 @@ async function serveStatic(req, res, pathname) {
   }
   if (PAGES[rel]) {
     const html = await site.render(rel);
+    if (!html) return false; // e.g. a legal page that isn't published yet
     send(req, res, 200, { "Content-Type": TYPES[".html"], "Cache-Control": "no-cache" }, Buffer.from(html));
     return true;
   }
@@ -1038,6 +1280,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/stripe-webhook" && req.method === "POST") return await handleStripeWebhook(req, res);
     if (url.pathname.startsWith("/download/") && req.method === "GET") return await handleDownload(req, res, url.pathname.slice(10));
     if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) return await handleAdmin(req, res, url);
+    if (url.pathname.startsWith("/media/") && req.method === "GET") return await serveMedia(req, res, url.pathname.slice(7));
     if (url.pathname === "/robots.txt") return send(req, res, 200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" }, Buffer.from(await site.robots()));
     if (url.pathname === "/sitemap.xml") return send(req, res, 200, { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=3600" }, Buffer.from(await site.sitemap()));
     if (req.method === "GET" && (await serveStatic(req, res, url.pathname))) return;
