@@ -5,7 +5,9 @@ Marketing site for Gatherable, LLC (https://gatherablehub.com) with two AI featu
 - **Smart intake** (`/#contact`): a four-step inquiry form. Each lead is saved to Postgres and, when an Anthropic API key is set, Claude writes George a short pre-meeting brief.
 - **Free Pitch Check** (`/pitch-check`): visitors upload a PDF deck or RFP response and get a scorecard on seven criteria, the top three fixes and likely client questions. The PDF is sent to Claude for analysis and is never stored.
 - **Digital product sales** (`/#checklist`): "Don't want to wait for a meeting? Get the comprehensive checklist." Products (title, price, description, file) are managed in the admin page. Buyers pay through Stripe Checkout and get a private download link (`/download/<token>`, up to 25 downloads). Files are stored in Postgres.
-- **Admin** (`/admin`, HTTP Basic auth with `ADMIN_PASSWORD`): lists leads, AI briefs and Pitch Check results, with a status per lead.
+- **Edit website text** (`/admin` → Website text): opens any page in editing mode; click text, type, save. Edits are stored in Postgres (`content`, with `content_history`) and applied when pages are served. Editable elements carry `data-edit` keys; run `node tools/assign-edit-keys.mjs` after adding new copy to the HTML.
+- **SEO** (`/admin` → SEO): per-page Google title and description with a live preview and checks, Search Console / Bing verification, optional Google Analytics. The server also serves `robots.txt`, `sitemap.xml`, social preview tags and structured data (business, founder, FAQ), with gzip compression.
+- **Admin** (`/admin`, HTTP Basic auth; the password can be changed in the admin page, falling back to `ADMIN_PASSWORD`): lists leads, AI briefs and Pitch Check results, with a status per lead.
 
 ## Stack
 
@@ -19,6 +21,8 @@ Marketing site for Gatherable, LLC (https://gatherablehub.com) with two AI featu
 | Path | What it is |
 |---|---|
 | `server.js` | HTTP server: static files, `/api/intake`, `/api/review`, `/admin`, `/api/health` |
+| `site.js` | Renders pages with text edits and SEO settings; robots, sitemap, structured data |
+| `admin-assets/editor.js` | The in-page text editor (served only behind the admin password) |
 | `prompts.js` | Review criteria, system prompts and output schemas. **The criteria are a draft: refine them with George.** |
 | `public/` | Site pages, styles, scripts and images |
 

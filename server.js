@@ -8,6 +8,8 @@ import pg from "pg";
 import Anthropic from "@anthropic-ai/sdk";
 import Stripe from "stripe";
 import { REVIEW_SYSTEM, REVIEW_SCHEMA, BRIEF_SYSTEM, BRIEF_SCHEMA } from "./prompts.js";
+import zlib from "node:zlib";
+import { createSite, PAGES, sanitizeInline } from "./site.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(here, "public");
@@ -92,6 +94,20 @@ async function migrate() {
       download_count    INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS orders_created_idx ON orders (created_at DESC);
+    CREATE TABLE IF NOT EXISTS content (
+      page       TEXT NOT NULL,
+      key        TEXT NOT NULL,
+      html       TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (page, key)
+    );
+    CREATE TABLE IF NOT EXISTS content_history (
+      id       BIGSERIAL PRIMARY KEY,
+      saved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      page     TEXT NOT NULL,
+      key      TEXT NOT NULL,
+      html     TEXT
+    );
     CREATE TABLE IF NOT EXISTS settings (
       key        TEXT PRIMARY KEY,
       value      TEXT NOT NULL,
@@ -103,6 +119,7 @@ async function migrate() {
 
 // ---------- Claude ----------
 const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
+const site = createSite({ pool, publicDir: PUBLIC, canonicalHost: process.env.CANONICAL_HOST });
 
 // ---------- Stripe ----------
 // Stripe keys come from the admin page (encrypted in the settings table) or, as a fallback, from env vars.
@@ -575,19 +592,143 @@ function notFound(res) {
 // ---------- admin ----------
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-function authorized(req) {
+// Admin password: a scrypt hash saved from the admin page wins; otherwise the ADMIN_PASSWORD env var.
+let adminHashCache; // undefined = not loaded, null = none saved
+async function savedAdminHash() {
+  if (adminHashCache !== undefined) return adminHashCache;
+  adminHashCache = null;
+  if (pool) {
+    try {
+      const r = await pool.query("SELECT value FROM settings WHERE key='admin_password'");
+      adminHashCache = r.rows[0]?.value || null;
+    } catch {}
+  }
+  return adminHashCache;
+}
+function hashPassword(pw) {
+  const salt = crypto.randomBytes(16);
+  const h = crypto.scryptSync(pw, salt, 64);
+  return ["scrypt", salt.toString("base64"), h.toString("base64")].join(":");
+}
+async function passwordMatches(given) {
+  const stored = await savedAdminHash();
+  if (stored) {
+    const [, salt, hash] = stored.split(":");
+    const want = Buffer.from(hash, "base64");
+    const got = crypto.scryptSync(given, Buffer.from(salt, "base64"), want.length);
+    return crypto.timingSafeEqual(got, want);
+  }
   const pass = process.env.ADMIN_PASSWORD;
   if (!pass) return false;
+  const x = crypto.createHash("sha256").update(given).digest();
+  const y = crypto.createHash("sha256").update(pass).digest();
+  return crypto.timingSafeEqual(x, y);
+}
+async function authorized(req) {
   const m = /^Basic (.+)$/.exec(req.headers.authorization || "");
   if (!m) return false;
+  const ip = clientIp(req);
+  if ((hits.get("adminfail:" + ip) || []).filter((t) => Date.now() - t < 15 * 60e3).length >= 10) return false;
   const given = Buffer.from(m[1], "base64").toString().split(":").slice(1).join(":");
-  const a = crypto.createHash("sha256").update(given).digest();
-  const b = crypto.createHash("sha256").update(pass).digest();
-  return crypto.timingSafeEqual(a, b);
+  const ok = await passwordMatches(given);
+  if (!ok) rateLimited("adminfail:" + ip, 1000, 15 * 60e3);
+  return ok;
+}
+
+async function handleAdminPassword(req, res) {
+  const b = await readBody(req, 4096);
+  const current = typeof b.current === "string" ? b.current : "";
+  const next = typeof b.next === "string" ? b.next : "";
+  if (!(await passwordMatches(current))) return json(res, 400, { error: "Your current password isn't right." });
+  if (next.length < 10) return json(res, 400, { error: "Use at least 10 characters for the new password." });
+  if (next === current) return json(res, 400, { error: "The new password is the same as the current one." });
+  await pool.query(
+    "INSERT INTO settings (key,value,updated_at) VALUES ('admin_password',$1,now()) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()",
+    [hashPassword(next)]
+  );
+  adminHashCache = undefined;
+  json(res, 200, { ok: true });
+}
+
+// ---- website text editing ----
+const EDITOR_JS = await fs.readFile(path.join(here, "admin-assets", "editor.js"), "utf8");
+const EDITOR_CSS = `#ge-bar{position:fixed;top:0;left:0;right:0;z-index:10000;background:#14294A;color:#fff;font:14px/1.3 system-ui,sans-serif;
+display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:10px 16px;box-shadow:0 4px 18px rgba(0,0,0,.25)}
+#ge-bar select,#ge-bar button,#ge-bar a{font:inherit;border-radius:7px;padding:6px 12px;border:0}
+#ge-bar select{background:#fff;color:#14294A;width:auto;min-width:200px}#ge-bar .tip{color:#A8CDCE;flex:1;min-width:200px}
+#ge-save{background:#2A919B;color:#fff;font-weight:600;cursor:pointer}#ge-undo{background:transparent;color:#fff;border:1px solid #A8CDCE!important;cursor:pointer}
+#ge-save:disabled,#ge-undo:disabled{opacity:.45;cursor:default}#ge-bar a{background:#fff;color:#14294A;text-decoration:none;font-weight:600}
+#ge-msg{color:#f0d58a;width:100%}#ge-msg:empty{display:none}
+body{padding-top:58px!important}header{top:58px!important}.track{animation:none!important}
+.ge-editable{outline:1px dashed rgba(42,145,155,.55);outline-offset:2px;border-radius:2px;cursor:text}
+.ge-editable:hover{outline:2px dashed #2A919B}.ge-editable:focus{outline:2px solid #2A919B;background:rgba(168,205,206,.18)}
+.ge-changed{background:rgba(240,213,138,.35)!important}`;
+
+async function handleAdminEdit(req, res, url) {
+  const page = url.searchParams.get("page") || "/";
+  if (!PAGES[page]) return notFound(res);
+  const labels = Object.fromEntries(Object.entries(PAGES).map(([p, v]) => [p, v.label]));
+  const editorHtml = `<style>${EDITOR_CSS}</style>
+<div id="ge-bar" role="toolbar" aria-label="Website editor"><b>✎ Editing</b><select id="ge-page" aria-label="Page"></select>
+<span class="tip">Click any outlined text and type. Ctrl/⌘+B for bold. Shift+Enter for a new line.</span>
+<span id="ge-count"></span><button type="button" id="ge-undo">Undo unsaved</button><button type="button" id="ge-save">Save changes</button>
+<a href="/admin#content">Done</a><span id="ge-msg" role="status"></span></div>
+<script>window.__EDIT_PAGE__=${JSON.stringify(page)};window.__EDIT_PAGES__=${JSON.stringify(labels).replace(/</g, "\\u003c")};</script>
+<script>${EDITOR_JS}</script>`;
+  const html = await site.render(page, { editorHtml });
+  send(req, res, 200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Robots-Tag": "noindex" }, Buffer.from(html));
+}
+
+async function handleAdminContent(req, res) {
+  const b = await readBody(req, 512 * 1024);
+  const page = String(b.page || "");
+  if (!PAGES[page]) return json(res, 400, { error: "Unknown page." });
+  const originals = await site.originals(page);
+  if (b.revert) {
+    const key = String(b.revert);
+    await pool.query("DELETE FROM content WHERE page=$1 AND key=$2", [page, key]);
+    await pool.query("INSERT INTO content_history (page,key,html) VALUES ($1,$2,NULL)", [page, key]);
+    site.invalidateContent();
+    return json(res, 200, { ok: true });
+  }
+  const changes = Object.entries(b.changes || {}).slice(0, 300);
+  for (const [key, raw] of changes) {
+    if (!(key in originals)) continue;
+    const html = sanitizeInline(raw);
+    if (!html) return json(res, 400, { error: "A piece of text can't be left empty. Undo it or type something." });
+    if (html === sanitizeInline(originals[key])) await pool.query("DELETE FROM content WHERE page=$1 AND key=$2", [page, key]);
+    else
+      await pool.query(
+        "INSERT INTO content (page,key,html,updated_at) VALUES ($1,$2,$3,now()) ON CONFLICT (page,key) DO UPDATE SET html=EXCLUDED.html, updated_at=now()",
+        [page, key, html]
+      );
+    await pool.query("INSERT INTO content_history (page,key,html) VALUES ($1,$2,$3)", [page, key, html]);
+  }
+  site.invalidateContent();
+  json(res, 200, { ok: true, saved: changes.length });
+}
+
+async function handleAdminSeo(req, res) {
+  const b = await readBody(req, 16 * 1024);
+  const seo = await site.getSeo();
+  const next = { ...seo, pages: { ...(seo.pages || {}) } };
+  for (const p of Object.keys(PAGES)) {
+    const v = b.pages?.[p];
+    if (v) next.pages[p] = { title: clean(v.title, 120), description: clean(v.description, 320) };
+  }
+  const gsc = clean(b.gsc, 200).replace(/^.*content="([^"]+)".*$/s, "$1");
+  if (gsc && !/^[A-Za-z0-9_-]{10,100}$/.test(gsc)) return json(res, 400, { error: "That Google verification code doesn't look right. Paste just the code, or the whole meta tag." });
+  const bing = clean(b.bing, 200).replace(/^.*content="([^"]+)".*$/s, "$1");
+  if (bing && !/^[A-Fa-f0-9]{16,64}$/.test(bing)) return json(res, 400, { error: "That Bing verification code doesn't look right." });
+  const ga4 = clean(b.ga4, 40).toUpperCase();
+  if (ga4 && !/^G-[A-Z0-9]{4,20}$/.test(ga4)) return json(res, 400, { error: "A Google Analytics ID looks like G-XXXXXXXXXX." });
+  Object.assign(next, { gsc, bing, ga4 });
+  await site.saveSeo(next);
+  json(res, 200, { ok: true });
 }
 
 async function handleAdmin(req, res, url) {
-  if (!authorized(req)) {
+  if (!(await authorized(req))) {
     res.writeHead(401, { "WWW-Authenticate": 'Basic realm="Gatherable admin"', "Content-Type": "text/plain" });
     return res.end("Authentication required");
   }
@@ -596,6 +737,10 @@ async function handleAdmin(req, res, url) {
     return json(res, 415, { error: "JSON required" });
   if (req.method === "POST" && url.pathname === "/admin/product") return await handleAdminProduct(req, res);
   if (req.method === "POST" && url.pathname === "/admin/stripe") return await handleAdminStripe(req, res);
+  if (req.method === "POST" && url.pathname === "/admin/password") return await handleAdminPassword(req, res);
+  if (req.method === "POST" && url.pathname === "/admin/content") return await handleAdminContent(req, res);
+  if (req.method === "POST" && url.pathname === "/admin/seo") return await handleAdminSeo(req, res);
+  if (req.method === "GET" && url.pathname === "/admin/edit") return await handleAdminEdit(req, res, url);
   if (req.method === "POST") {
     const b = await readBody(req, 4096);
     if (["new", "contacted", "won", "closed"].includes(b.status) && Number(b.id))
@@ -620,7 +765,9 @@ async function handleAdmin(req, res, url) {
   ).rows;
   const base = siteUrl(req);
   const pay = await getPayments();
-  const payHtml = `<section><h2>Payments (Stripe)</h2>
+  const newLeads = leads.filter((l) => l.status === "new").length;
+  const live = products.filter((p) => p.active).length;
+  const payHtml = `<section id="payments"><h2>Payments (Stripe)</h2>
     ${pay.stripe
       ? `<p class="ok">✓ Connected to Stripe in <b>${pay.mode === "live" ? "LIVE" : "TEST"}</b> mode with the key ending in <b>…${esc(pay.last4)}</b>${pay.source === "env" ? " (set in Render)" : ""}.
          ${pay.webhookSecret ? "Webhook is set up." : "Webhook not set up yet (sales still work)."}${pay.mode === "test" ? " Test mode: use Stripe test cards; no real money moves." : ""}</p>`
@@ -645,19 +792,6 @@ async function handleAdmin(req, res, url) {
       <label>File ${p?.file_name ? `(current: ${esc(p.file_name)}, ${Math.round((p.file_bytes || 0) / 1024)} KB — choose a file only to replace it)` : "(PDF recommended, max 10 MB)"}<input name="file" type="file"></label>
       <button>${p ? "Save changes" : "Add product"}</button> <span class="msg"></span>
     </form>`;
-  const shopHtml = `<section><h2>Digital products</h2>
-    ${pay.stripe ? "" : '<p class="warn">Products stay hidden on the website until Stripe is connected above.</p>'}
-    ${products.map(productForm).join("")}
-    <details${products.length ? "" : " open"}><summary>+ Add a product</summary>${productForm(null)}</details>
-    <h3>Sales (${orders.length})</h3>
-    ${orders.length ? `<table><tr><th>Date</th><th>Product</th><th>Buyer</th><th>Amount</th><th>Downloads</th><th>Link</th></tr>${orders
-      .map(
-        (o) => `<tr><td>${new Date(o.paid_at).toLocaleDateString("en-US", { timeZone: "America/New_York" })}</td><td>${esc(o.title)}</td>
-        <td>${esc(o.name || "")}<br><a href="mailto:${esc(o.email)}">${esc(o.email)}</a></td><td>${money(o.amount_cents, o.currency || "usd")}</td>
-        <td>${o.download_count}/${MAX_DOWNLOADS}</td><td><button type="button" class="copy" data-link="${esc(base + "/download/" + o.download_token)}">Copy link</button></td></tr>`
-      )
-      .join("")}</table>` : "<p>No sales yet.</p>"}
-  </section>`;
   const rows = leads
     .map((l) => {
       const brief = l.ai_brief;
@@ -676,23 +810,123 @@ async function handleAdmin(req, res, url) {
     </article>`;
     })
     .join("");
+  const leadsHtml = `<section id="leads"><h2>Leads <small>${leads.length} total · ${newLeads} new</small></h2>
+    ${rows || "<p>No leads yet.</p>"}</section>`;
+  const productsHtml = `<section id="products"><h2>Digital products <small>${live} live of ${products.length}</small></h2>
+    ${pay.stripe ? "" : '<p class="warn">Products stay hidden on the website until Stripe is connected in <a href="#payments">Payments</a>.</p>'}
+    ${products.map(productForm).join("")}
+    <details${products.length ? "" : " open"}><summary>+ Add a product</summary>${productForm(null)}</details>
+  </section>`;
+  const salesHtml = `<section id="sales"><h2>Sales <small>${orders.length}</small></h2>
+    ${orders.length ? `<table><tr><th>Date</th><th>Product</th><th>Buyer</th><th>Amount</th><th>Downloads</th><th>Link</th></tr>${orders
+      .map(
+        (o) => `<tr><td>${new Date(o.paid_at).toLocaleDateString("en-US", { timeZone: "America/New_York" })}</td><td>${esc(o.title)}</td>
+        <td>${esc(o.name || "")}<br><a href="mailto:${esc(o.email)}">${esc(o.email)}</a></td><td>${money(o.amount_cents, o.currency || "usd")}</td>
+        <td>${o.download_count}/${MAX_DOWNLOADS}</td><td><button type="button" class="copy" data-link="${esc(base + "/download/" + o.download_token)}">Copy link</button></td></tr>`
+      )
+      .join("")}</table>` : "<p>No sales yet.</p>"}
+  </section>`;
+  // Website text: list of saved edits with a revert button each.
+  const edits = (await pool.query("SELECT page, key, html, updated_at FROM content ORDER BY updated_at DESC")).rows;
+  const origByPage = {};
+  for (const p of Object.keys(PAGES)) origByPage[p] = await site.originals(p);
+  const strip = (h) => String(h || "").replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&nbsp;/g, " ").trim();
+  const contentHtml = `<section id="content"><h2>Website text <small>${edits.length} edited</small></h2>
+    <p>Change any heading, paragraph, button or list item on the site yourself. Click below, then click the text you want to change and type.</p>
+    <p><a class="btnlink" href="/admin/edit?page=/">✎ Edit home page</a> <a class="btnlink alt" href="/admin/edit?page=/pitch-check">✎ Edit Pitch Check page</a> <a class="btnlink alt" href="/admin/edit?page=/thank-you">✎ Edit thank-you page</a></p>
+    ${edits.length ? `<h3>Your changes</h3><table class="edits"><tr><th>Page</th><th>Originally</th><th>Now</th><th></th></tr>${edits
+      .map((e) => `<tr><td>${esc(PAGES[e.page]?.label || e.page)}</td><td class="was">${esc(strip(origByPage[e.page]?.[e.key]))}</td><td>${esc(strip(e.html))}</td>
+        <td><button type="button" class="revert" data-page="${esc(e.page)}" data-key="${esc(e.key)}">Revert</button></td></tr>`)
+      .join("")}</table>` : '<p class="hint">No changes yet. Everything shows the original text.</p>'}
+  </section>`;
+  // SEO
+  const seo = await site.getSeo();
+  const aud = await site.audit();
+  const tick = ([ok, text]) => `<li class="${ok === null ? "info" : ok ? "pass" : "fail"}">${ok === null ? "–" : ok ? "✓" : "!"} ${esc(text)}</li>`;
+  const seoHtml = `<section id="seo"><h2>SEO</h2>
+    <p>How the site shows up in Google. The checks update as you change things.</p>
+    <ul class="checks">${aud.site.map(tick).join("")}</ul>
+    <form id="seo-form" class="prod">
+    ${aud.pages
+      .map((pg) => `<fieldset><legend>${esc(pg.label)}</legend>
+        <div class="serp"><span class="u">gatherablehub.com${pg.path === "/" ? "" : " › " + esc(pg.path.slice(1))}</span><span class="t" data-for="${esc(pg.path)}">${esc(pg.title)}</span><span class="d" data-for="${esc(pg.path)}">${esc(pg.desc)}</span></div>
+        <label>Title in Google <span class="cnt"></span><input name="title" data-page="${esc(pg.path)}" maxlength="120" value="${esc(seo.pages?.[pg.path]?.title || pg.title)}"></label>
+        <label>Description in Google <span class="cnt"></span><textarea name="description" data-page="${esc(pg.path)}" rows="2" maxlength="320">${esc(seo.pages?.[pg.path]?.description || pg.desc)}</textarea></label>
+        <ul class="checks">${pg.checks.map(tick).join("")}</ul></fieldset>`)
+      .join("")}
+      <fieldset><legend>Search engines &amp; analytics</legend>
+        <label>Google Search Console verification code <input name="gsc" value="${esc(seo.gsc)}" placeholder="Paste the code or the whole &lt;meta&gt; tag"></label>
+        <p class="hint">In <a href="https://search.google.com/search-console" target="_blank" rel="noopener">Google Search Console</a>: Add property → URL prefix → https://gatherablehub.com → HTML tag. Paste it here, save, then click Verify in Google. Then submit the sitemap: <b>${esc(base)}/sitemap.xml</b></p>
+        <label>Bing Webmaster verification code (optional) <input name="bing" value="${esc(seo.bing)}"></label>
+        <label>Google Analytics measurement ID (optional) <input name="ga4" value="${esc(seo.ga4)}" placeholder="G-XXXXXXXXXX"></label>
+      </fieldset>
+      <div><button>Save SEO settings</button> <span class="msg"></span></div>
+    </form>
+  </section>`;
+  const passwordHtml = `<section id="password"><h2>Admin password</h2>
+    <form id="pw-form" class="prod">
+      <label>Current password<input name="current" type="password" autocomplete="current-password" required></label>
+      <div class="g2"><label>New password<input name="next" type="password" autocomplete="new-password" minlength="10" required></label>
+      <label>Confirm new password<input name="confirm" type="password" autocomplete="new-password" minlength="10" required></label></div>
+      <p class="hint">At least 10 characters. After saving, your browser will ask you to sign in again with the new password.</p>
+      <div><button>Change password</button> <span class="msg"></span></div>
+    </form>
+  </section>`;
+  const nav = [
+    ["leads", "Leads", newLeads ? `<b class="badge">${newLeads}</b>` : ""],
+    ["products", "Products", ""],
+    ["sales", "Sales", orders.length ? `<b class="badge muted">${orders.length}</b>` : ""],
+    ["content", "Website text", ""],
+    ["seo", "SEO", aud.site.some(([ok]) => ok === false) || aud.pages.some((p) => p.checks.some(([ok]) => ok === false)) ? '<b class="badge warnb">!</b>' : ""],
+    ["password", "Password", ""],
+    ["payments", "Payments", pay.stripe ? "" : '<b class="badge warnb">off</b>'],
+  ];
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Robots-Tag": "noindex" });
-  res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gatherable leads</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;margin:0;background:#EEF5F5;color:#14294A}main{max-width:900px;margin:0 auto;padding:24px 16px}
+  res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gatherable admin</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;margin:0;background:#EEF5F5;color:#14294A}
 h1{font-size:1.5rem}.lead{background:#fff;border:1px solid #D5E2E4;border-radius:12px;padding:16px 18px;margin-bottom:14px}
 .lead header{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}small{color:#526276}.brief{background:#F6FAFA;border-left:3px solid #2A919B;padding:10px 14px;margin-top:10px;border-radius:6px}
 .brief p{margin:6px 0}ul{margin:4px 0 0;padding-left:20px}select{font:inherit;padding:4px 6px}
 .tabs{display:flex;gap:16px;margin-bottom:8px}#shop section{background:#fff;border:1px solid #D5E2E4;border-radius:12px;padding:18px;margin:12px 0 28px}
 .prod{border:1px solid #D5E2E4;border-radius:10px;padding:14px;margin:12px 0;display:grid;gap:10px}.prod .g{display:grid;grid-template-columns:2fr 1fr 1.4fr 1.2fr;gap:10px;align-items:end}
-.prod label{display:grid;gap:4px;font-size:.85rem;font-weight:600}.prod input,.prod textarea{font:inherit;font-weight:400;padding:7px 9px;border:1px solid #CBD6D5;border-radius:7px}
+.prod label{display:grid;gap:4px;font-size:.85rem;font-weight:600}.prod input:not([type=checkbox]),.prod textarea{min-width:0;width:100%;box-sizing:border-box}.prod .g>*{min-width:0}.prod input,.prod textarea{font:inherit;font-weight:400;padding:7px 9px;border:1px solid #CBD6D5;border-radius:7px}
 .prod .chk{display:flex;gap:8px;align-items:center}.prod .chk input{width:auto}.prod button,.copy{font:inherit;font-weight:600;background:#2A919B;color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;justify-self:start}
 .copy{background:#13468B;padding:5px 10px;font-size:.85rem}.prod .danger{background:#b42318}.ok{background:#e5f4e4;border:1px solid #b9dfb6;padding:8px 12px;border-radius:8px}
 .hint{font-size:.85rem;color:#526276;margin:0}details summary{cursor:pointer;font-size:.9rem;color:#13468B}.warn{background:#fff6e0;border:1px solid #f0d58a;padding:8px 12px;border-radius:8px}
 table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:8px 6px;border-top:1px solid #E4EAE9;vertical-align:top}
-@media(max-width:700px){.prod .g{grid-template-columns:1fr 1fr}}</style></head>
-<body><main><nav class="tabs"><a href="#leads">Leads</a><a href="#shop">Digital products &amp; sales</a></nav>
-<div id="shop">${payHtml}${shopHtml}</div>
-<h1 id="leads">Leads (${leads.length})</h1>${rows || "<p>No leads yet.</p>"}</main>
+@media(max-width:700px){.prod .g{grid-template-columns:1fr 1fr}}@media(max-width:520px){.prod .g{grid-template-columns:1fr}.edits{display:block;overflow-x:auto}}
+.layout{display:grid;grid-template-columns:220px 1fr;min-height:100vh}
+.side{background:#14294A;color:#fff;position:sticky;top:0;height:100vh;padding:22px 14px;box-sizing:border-box}
+.side .brand{font-weight:700;font-size:1.1rem;padding:0 10px 18px}.side .brand small{display:block;color:#A8CDCE;font-weight:400;font-size:.8rem}
+.side a{display:flex;justify-content:space-between;align-items:center;color:#dbe7ea;text-decoration:none;padding:9px 10px;border-radius:8px;margin-bottom:2px}
+.side a:hover{background:rgba(255,255,255,.08)}.side a.on{background:#2A919B;color:#fff}
+.side .sep{border-top:1px solid rgba(168,205,206,.25);margin:12px 4px;font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;color:#A8CDCE;padding-top:12px}
+.side .foot{position:absolute;bottom:18px;left:24px;font-size:.85rem}.side .foot a{color:#A8CDCE;padding:0;display:inline}
+.badge{background:#fff;color:#14294A;border-radius:999px;padding:0 8px;font-size:.75rem;line-height:1.6}.badge.muted{background:rgba(255,255,255,.2);color:#fff}.badge.warnb{background:#f0d58a}
+main{padding:28px 32px 40vh;max-width:960px}
+main section{background:#fff;border:1px solid #D5E2E4;border-radius:12px;padding:20px;margin:0 0 28px;scroll-margin-top:16px}
+main h2{margin:0 0 12px;font-size:1.3rem}main h2 small{font-size:.85rem;color:#526276;font-weight:400;margin-left:6px}
+#leads{background:none;border:0;padding:0}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.btnlink{display:inline-block;background:#2A919B;color:#fff;text-decoration:none;font-weight:600;padding:9px 14px;border-radius:8px;margin:0 6px 6px 0}.btnlink.alt{background:#13468B}
+.edits td.was{color:#526276;text-decoration:line-through}.revert{font:inherit;font-size:.85rem;background:#fff;border:1px solid #CBD6D5;border-radius:7px;padding:4px 10px;cursor:pointer}
+.checks{list-style:none;padding:0;margin:8px 0}.checks li{padding:3px 0;font-size:.92rem}.checks .pass{color:#2b6a2f}.checks .fail{color:#9a5b00;font-weight:600}.checks .info{color:#526276}
+fieldset{border:1px solid #D5E2E4;border-radius:10px;padding:12px 14px;margin:0;display:grid;gap:10px}legend{font-weight:700;padding:0 6px}
+.serp{border:1px solid #E4EAE9;border-radius:8px;padding:10px 12px;font-family:arial,sans-serif;background:#fff}.serp span{display:block}
+.serp .u{color:#202124;font-size:12px}.serp .t{color:#1a0dab;font-size:18px;line-height:1.3;margin:2px 0}.serp .d{color:#4d5156;font-size:13px}
+.cnt{font-weight:400;color:#526276;font-size:.8rem}.cnt.bad{color:#9a5b00}
+@media(max-width:800px){.layout{grid-template-columns:minmax(0,1fr)}.layout>*{min-width:0}.side{position:sticky;height:auto;display:flex;gap:4px;overflow-x:auto;padding:10px;z-index:5}
+.side .brand,.side .sep,.side .foot{display:none}.side a{white-space:nowrap;margin:0}main{padding:18px 14px}.g2{grid-template-columns:1fr}}
+</style></head>
+<body><div class="layout">
+<nav class="side" aria-label="Admin sections"><div class="brand">Gatherable<small>Admin</small></div>
+${nav.slice(0, 3).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"><span>${label}</span>${extra}</a>`).join("")}
+<div class="sep">Website</div>
+${nav.slice(3, 5).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"><span>${label}</span>${extra}</a>`).join("")}
+<div class="sep">Settings</div>
+${nav.slice(5).map(([id, label, extra]) => `<a href="#${id}" data-sec="${id}"><span>${label}</span>${extra}</a>`).join("")}
+<div class="foot"><a href="/" target="_blank" rel="noopener">View website ↗</a></div></nav>
+<main>${leadsHtml}${productsHtml}${salesHtml}${contentHtml}${seoHtml}${passwordHtml}${payHtml}</main></div>
 <script>
 document.querySelectorAll('select[data-id]').forEach(s=>s.addEventListener('change',()=>fetch('/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:s.dataset.id,status:s.value})})));
 const sf=document.getElementById('stripe-form');
@@ -704,7 +938,7 @@ if(sf){sf.addEventListener('submit',async e=>{e.preventDefault();const m=sf.quer
  if(rm)rm.addEventListener('click',async()=>{if(!confirm('Disconnect Stripe? Products will be hidden until a key is added again.'))return;
   await fetch('/admin/stripe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'remove'})});location.reload();});}
 document.querySelectorAll('.copy').forEach(b=>b.addEventListener('click',()=>{navigator.clipboard.writeText(b.dataset.link);b.textContent='Copied'}));
-document.querySelectorAll('form.prod:not(#stripe-form)').forEach(f=>f.addEventListener('submit',async e=>{
+document.querySelectorAll('form.prod[data-id]').forEach(f=>f.addEventListener('submit',async e=>{
   e.preventDefault();const m=f.querySelector('.msg'),btn=f.querySelector('button');m.textContent='Saving…';btn.disabled=true;
   const el=f.elements;const body={id:f.dataset.id||null,title:el.title.value,slug:el.slug.value,price:el.price.value,description:el.description.value,active:el.active.checked};
   const file=el.file.files[0];
@@ -714,26 +948,69 @@ document.querySelectorAll('form.prod:not(#stripe-form)').forEach(f=>f.addEventLi
   const d=await r.json().catch(()=>({}));btn.disabled=false;
   if(r.ok){m.textContent='Saved';setTimeout(()=>location.reload(),600)}else m.textContent=d.error||'Could not save';
 }));
+document.querySelectorAll('.revert').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('Put back the original text?'))return;b.disabled=true;
+  await fetch('/admin/content',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({page:b.dataset.page,revert:b.dataset.key})});location.reload()}));
+const sfm=document.getElementById('seo-form');
+const lim={title:[30,60],description:[70,160]};
+function cnt(i){const c=i.closest('label').querySelector('.cnt'),[lo,hi]=lim[i.name];const n=i.value.trim().length;c.textContent=n+' characters (aim for '+lo+'–'+hi+')';c.classList.toggle('bad',n<lo||n>hi);
+  const s=document.querySelector('.serp .'+(i.name==='title'?'t':'d')+'[data-for="'+i.dataset.page+'"]');if(s)s.textContent=i.value;}
+sfm.querySelectorAll('[data-page]').forEach(i=>{cnt(i);i.addEventListener('input',()=>cnt(i))});
+sfm.addEventListener('submit',async e=>{e.preventDefault();const m=sfm.querySelector('.msg'),btn=sfm.querySelector('button');btn.disabled=true;m.textContent='Saving…';
+  const pages={};sfm.querySelectorAll('[data-page]').forEach(i=>{(pages[i.dataset.page]??={})[i.name]=i.value});
+  const el=sfm.elements;const r=await fetch('/admin/seo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pages,gsc:el.gsc.value.trim(),bing:el.bing.value.trim(),ga4:el.ga4.value.trim()})});
+  const d=await r.json().catch(()=>({}));btn.disabled=false;if(r.ok){m.textContent='Saved';setTimeout(()=>location.reload(),700)}else m.textContent=d.error||'Could not save';});
+const pf=document.getElementById('pw-form');
+pf.addEventListener('submit',async e=>{e.preventDefault();const m=pf.querySelector('.msg'),btn=pf.querySelector('button'),el=pf.elements;
+  if(el.next.value!==el.confirm.value){m.textContent='The new passwords don\\'t match.';return}
+  btn.disabled=true;m.textContent='Saving…';
+  const r=await fetch('/admin/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current:el.current.value,next:el.next.value})});
+  const d=await r.json().catch(()=>({}));btn.disabled=false;
+  if(r.ok){pf.reset();m.textContent='Password changed. Sign in again with the new password.';setTimeout(()=>location.reload(),2500)}else m.textContent=d.error||'Could not change it';});
+const links=[...document.querySelectorAll('.side a[data-sec]')];
+const io=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting){links.forEach(a=>a.classList.toggle('on',a.dataset.sec===e.target.id))}})},{rootMargin:'-20% 0px -70% 0px'});
+links.forEach(a=>{const s=document.getElementById(a.dataset.sec);if(s)io.observe(s)});
+links.forEach(a=>a.addEventListener('click',()=>setTimeout(()=>links.forEach(x=>x.classList.toggle('on',x===a)),400)));
 </script></body></html>`);
 }
 
 // ---------- static ----------
 const TYPES = { ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml", ".webp": "image/webp", ".png": "image/png", ".txt": "text/plain", ".xml": "application/xml" };
 
-async function serveStatic(res, pathname) {
+const COMPRESSIBLE = /^(text\/|application\/(json|xml|javascript)|image\/svg)/;
+function send(req, res, status, headers, body) {
+  const type = headers["Content-Type"] || "";
+  if (COMPRESSIBLE.test(type) && body.length > 1024 && /\bgzip\b/.test(req.headers["accept-encoding"] || "")) {
+    body = zlib.gzipSync(body);
+    headers = { ...headers, "Content-Encoding": "gzip", Vary: "Accept-Encoding" };
+  }
+  res.writeHead(status, headers);
+  res.end(body);
+}
+
+async function serveStatic(req, res, pathname) {
   let rel = decodeURIComponent(pathname);
-  if (rel === "/") rel = "/index.html";
-  if (!path.extname(rel)) rel += ".html"; // /pitch-check -> pitch-check.html
+  // Editable pages are rendered with the admin's text edits and SEO settings applied.
+  const clean = rel.replace(/\.html$/, "").replace(/^\/index$/, "/");
+  if (clean !== rel && PAGES[clean]) {
+    res.writeHead(301, { Location: clean });
+    res.end();
+    return true;
+  }
+  if (PAGES[rel]) {
+    const html = await site.render(rel);
+    send(req, res, 200, { "Content-Type": TYPES[".html"], "Cache-Control": "no-cache" }, Buffer.from(html));
+    return true;
+  }
+  if (!path.extname(rel)) rel += ".html";
   const file = path.normalize(path.join(PUBLIC, rel));
   if (!file.startsWith(PUBLIC)) return false;
   try {
     const data = await fs.readFile(file);
     const ext = path.extname(file);
-    res.writeHead(200, {
+    send(req, res, 200, {
       "Content-Type": TYPES[ext] || "application/octet-stream",
       "Cache-Control": ext === ".html" ? "no-cache" : "public, max-age=604800",
-    });
-    res.end(data);
+    }, data);
     return true;
   } catch {
     return false;
@@ -760,8 +1037,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/order" && req.method === "GET") return await handleOrderStatus(req, res, url);
     if (url.pathname === "/api/stripe-webhook" && req.method === "POST") return await handleStripeWebhook(req, res);
     if (url.pathname.startsWith("/download/") && req.method === "GET") return await handleDownload(req, res, url.pathname.slice(10));
-    if (url.pathname === "/admin" || url.pathname === "/admin/product" || url.pathname === "/admin/stripe") return await handleAdmin(req, res, url);
-    if (req.method === "GET" && (await serveStatic(res, url.pathname))) return;
+    if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) return await handleAdmin(req, res, url);
+    if (url.pathname === "/robots.txt") return send(req, res, 200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "public, max-age=3600" }, Buffer.from(await site.robots()));
+    if (url.pathname === "/sitemap.xml") return send(req, res, 200, { "Content-Type": "application/xml; charset=utf-8", "Cache-Control": "public, max-age=3600" }, Buffer.from(await site.sitemap()));
+    if (req.method === "GET" && (await serveStatic(req, res, url.pathname))) return;
     notFound(res);
   } catch (e) {
     console.error(e);
