@@ -241,3 +241,12 @@ legend{font:600 1.35rem/1.2 var(--serif);margin-bottom:18px;padding:0}
 .cta-box p{color:#dbe7ea}
 .disclaimer{font-size:.82rem;color:var(--muted);margin-top:18px}
 @media (max-width:860px){.pc-grid{grid-template-columns:1fr}.bar-row{grid-template-columns:1fr 34px}.bar-row .bar{grid-column:1/-1;grid-row:2}}
+
+/* digital product */
+.buy{background:var(--mist);padding:72px 0}
+.buy-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:48px;align-items:center}
+.buy-card{background:#fff;border:2px solid var(--teal);border-radius:18px;padding:30px;box-shadow:0 20px 40px -26px rgba(42,145,155,.6)}
+.buy-card h3{font-size:1.45rem;margin-bottom:6px}
+.price{font:600 2.2rem/1 var(--serif);color:var(--navy);margin:10px 0 20px}
+.buy-card .fine{color:var(--muted)}
+@media (max-width:860px){.buy-grid{grid-template-columns:1fr;gap:28px}}

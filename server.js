@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import Anthropic from "@anthropic-ai/sdk";
+import Stripe from "stripe";
 import { REVIEW_SYSTEM, REVIEW_SCHEMA, BRIEF_SYSTEM, BRIEF_SCHEMA } from "./prompts.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -61,12 +62,47 @@ async function migrate() {
       output_tokens INTEGER
     );
     CREATE INDEX IF NOT EXISTS reviews_created_idx ON reviews (created_at DESC);
+    CREATE TABLE IF NOT EXISTS products (
+      id           BIGSERIAL PRIMARY KEY,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      slug         TEXT NOT NULL UNIQUE,
+      title        TEXT NOT NULL,
+      description  TEXT NOT NULL DEFAULT '',
+      price_cents  INTEGER NOT NULL CHECK (price_cents >= 50),
+      currency     TEXT NOT NULL DEFAULT 'usd',
+      active       BOOLEAN NOT NULL DEFAULT false,
+      file_name    TEXT,
+      file_mime    TEXT,
+      file_bytes   INTEGER,
+      file_data    BYTEA
+    );
+    CREATE TABLE IF NOT EXISTS orders (
+      id                BIGSERIAL PRIMARY KEY,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      paid_at           TIMESTAMPTZ,
+      product_id        BIGINT NOT NULL REFERENCES products(id),
+      stripe_session_id TEXT UNIQUE,
+      status            TEXT NOT NULL DEFAULT 'pending',
+      email             TEXT,
+      name              TEXT,
+      amount_cents      INTEGER,
+      currency          TEXT,
+      download_token    TEXT NOT NULL UNIQUE,
+      download_count    INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS orders_created_idx ON orders (created_at DESC);
   `);
   console.log("database ready");
 }
 
 // ---------- Claude ----------
 const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
+
+// ---------- Stripe ----------
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+const MAX_DOWNLOADS = 25;
+const MAX_PRODUCT_FILE = 10 * 1024 * 1024;
 
 // One structured-output call. Refusal fallback is enabled server-side ("default" routing).
 async function askClaude({ system, content, schema, effort, maxTokens }) {
@@ -267,6 +303,177 @@ async function handleReview(req, res) {
   }
 }
 
+// ---------- shop ----------
+const siteUrl = (req) =>
+  process.env.CANONICAL_HOST ? `https://${process.env.CANONICAL_HOST}` : `${req.headers["x-forwarded-proto"] || "http"}://${req.headers.host}`;
+
+async function handleProducts(req, res) {
+  if (!pool || !stripe) return json(res, 200, { products: [] });
+  const r = await pool.query(
+    "SELECT slug,title,description,price_cents,currency FROM products WHERE active AND file_data IS NOT NULL ORDER BY id"
+  );
+  json(res, 200, { products: r.rows });
+}
+
+async function handleCheckout(req, res) {
+  if (!pool || !stripe) return json(res, 503, { error: "Purchasing isn't available right now. Please try again later." });
+  if (rateLimited("checkout:" + clientIp(req), 20, 3600e3)) return json(res, 429, { error: "Too many attempts. Please try again later." });
+  const b = await readBody(req, 4096);
+  const p = (
+    await pool.query("SELECT id,slug,title,description,price_cents,currency FROM products WHERE slug=$1 AND active AND file_data IS NOT NULL", [
+      clean(b.slug, 80),
+    ])
+  ).rows[0];
+  if (!p) return json(res, 404, { error: "That item isn't available." });
+  const token = crypto.randomBytes(24).toString("base64url");
+  const order = (await pool.query("INSERT INTO orders (product_id,download_token) VALUES ($1,$2) RETURNING id", [p.id, token])).rows[0];
+  const base = siteUrl(req);
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: p.currency,
+          unit_amount: p.price_cents,
+          product_data: { name: p.title, ...(p.description ? { description: p.description.slice(0, 500) } : {}) },
+        },
+      },
+    ],
+    client_reference_id: String(order.id),
+    metadata: { order_id: String(order.id), product: p.slug },
+    success_url: `${base}/thank-you?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${base}/#checklist`,
+  });
+  await pool.query("UPDATE orders SET stripe_session_id=$1 WHERE id=$2", [session.id, order.id]);
+  json(res, 200, { url: session.url });
+}
+
+// Marks an order paid from a Stripe Checkout Session (idempotent).
+async function recordPayment(session) {
+  if (session.payment_status !== "paid") return null;
+  const r = await pool.query(
+    `UPDATE orders SET status='paid', paid_at=COALESCE(paid_at, now()), email=$2, name=$3, amount_cents=$4, currency=$5
+      WHERE stripe_session_id=$1 RETURNING *`,
+    [session.id, session.customer_details?.email || null, session.customer_details?.name || null, session.amount_total, session.currency]
+  );
+  return r.rows[0] || null;
+}
+
+async function handleOrderStatus(req, res, url) {
+  if (!pool || !stripe) return json(res, 503, { error: "unavailable" });
+  const sid = clean(url.searchParams.get("session_id"), 200);
+  if (!/^cs_[A-Za-z0-9_]+$/.test(sid)) return json(res, 400, { error: "Invalid link." });
+  let o = (
+    await pool.query("SELECT o.*, p.title FROM orders o JOIN products p ON p.id=o.product_id WHERE o.stripe_session_id=$1", [sid])
+  ).rows[0];
+  if (!o) return json(res, 404, { error: "Order not found." });
+  if (o.status !== "paid") {
+    const session = await stripe.checkout.sessions.retrieve(sid);
+    if (await recordPayment(session)) o.status = "paid";
+  }
+  if (o.status !== "paid") return json(res, 200, { status: "pending", title: o.title });
+  json(res, 200, { status: "paid", title: o.title, email: o.email, download_url: `/download/${o.download_token}` });
+}
+
+async function handleStripeWebhook(req, res) {
+  if (!pool || !stripe) return json(res, 503, { error: "unavailable" });
+  const raw = await new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => { size += c.length; if (size > 1024 * 1024) req.destroy(); else chunks.push(c); });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+  if (!process.env.STRIPE_WEBHOOK_SECRET) return json(res, 503, { error: "Webhook secret not configured" });
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(raw, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (e) {
+    return json(res, 400, { error: "Invalid signature" });
+  }
+  if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
+    await recordPayment(event.data.object);
+  }
+  json(res, 200, { received: true });
+}
+
+async function handleDownload(req, res, token) {
+  if (!pool || !/^[A-Za-z0-9_-]{20,64}$/.test(token)) return notFound(res);
+  const r = await pool.query(
+    `UPDATE orders o SET download_count = download_count + 1
+       FROM products p
+      WHERE o.download_token=$1 AND o.status='paid' AND o.download_count < $2 AND p.id=o.product_id AND p.file_data IS NOT NULL
+      RETURNING p.file_name, p.file_mime, p.file_data`,
+    [token, MAX_DOWNLOADS]
+  );
+  const f = r.rows[0];
+  if (!f) {
+    res.writeHead(410, { "Content-Type": "text/html; charset=utf-8" });
+    return res.end('<!doctype html><title>Download unavailable</title><p style="font-family:sans-serif;padding:40px">This download link is no longer available. Email <a href="mailto:galinsky.george@gmail.com">galinsky.george@gmail.com</a> and we\'ll sort it out.</p>');
+  }
+  res.writeHead(200, {
+    "Content-Type": f.file_mime || "application/octet-stream",
+    "Content-Disposition": `attachment; filename="${String(f.file_name || "download").replace(/[^\w.\- ]/g, "_")}"`,
+    "Cache-Control": "private, no-store",
+    "X-Robots-Tag": "noindex",
+  });
+  res.end(f.file_data);
+}
+
+async function handleAdminProduct(req, res) {
+  const b = await readBody(req);
+  const title = clean(b.title, 160);
+  const slug = clean(b.slug, 80).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, "");
+  const description = clean(b.description, 1000);
+  const price = Math.round(Number(b.price) * 100);
+  if (!title || !slug) return json(res, 400, { error: "Title and URL name are required." });
+  if (!Number.isFinite(price) || price < 50) return json(res, 400, { error: "Price must be at least $0.50." });
+  let file = null;
+  if (b.file?.data) {
+    const buf = Buffer.from(b.file.data, "base64");
+    if (buf.length > MAX_PRODUCT_FILE) return json(res, 413, { error: "File must be under 10 MB." });
+    file = { name: clean(b.file.name, 200) || "download", mime: clean(b.file.type, 100) || "application/octet-stream", data: buf };
+  }
+  const active = !!b.active;
+  const id = Number(b.id) || null;
+  if (active && !file) {
+    const has = id ? (await pool.query("SELECT file_data IS NOT NULL AS ok FROM products WHERE id=$1", [id])).rows[0]?.ok : false;
+    if (!has) return json(res, 400, { error: "Upload the file before making it live." });
+  }
+  try {
+    let row;
+    if (id) {
+      row = (
+        await pool.query(
+          `UPDATE products SET title=$2, slug=$3, description=$4, price_cents=$5, active=$6, updated_at=now()
+             ${file ? ", file_name=$7, file_mime=$8, file_data=$9, file_bytes=$10" : ""}
+           WHERE id=$1 RETURNING id`,
+          file ? [id, title, slug, description, price, active, file.name, file.mime, file.data, file.data.length] : [id, title, slug, description, price, active]
+        )
+      ).rows[0];
+    } else {
+      row = (
+        await pool.query(
+          `INSERT INTO products (title,slug,description,price_cents,active,file_name,file_mime,file_data,file_bytes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+          [title, slug, description, price, active, file?.name ?? null, file?.mime ?? null, file?.data ?? null, file?.data.length ?? null]
+        )
+      ).rows[0];
+    }
+    if (!row) return json(res, 404, { error: "Product not found." });
+    json(res, 200, { ok: true, id: row.id });
+  } catch (e) {
+    if (e.code === "23505") return json(res, 400, { error: "That URL name is already used by another product." });
+    throw e;
+  }
+}
+
+function notFound(res) {
+  res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
+  res.end('<!doctype html><title>Not found</title><p style="font-family:sans-serif;padding:40px">Page not found. <a href="/">Go to Gatherable</a></p>');
+}
+
 // ---------- admin ----------
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
@@ -287,6 +494,9 @@ async function handleAdmin(req, res, url) {
     return res.end("Authentication required");
   }
   if (!pool) return json(res, 503, { error: "No database configured" });
+  if (req.method === "POST" && !String(req.headers["content-type"] || "").startsWith("application/json"))
+    return json(res, 415, { error: "JSON required" });
+  if (req.method === "POST" && url.pathname === "/admin/product") return await handleAdminProduct(req, res);
   if (req.method === "POST") {
     const b = await readBody(req, 4096);
     if (["new", "contacted", "won", "closed"].includes(b.status) && Number(b.id))
@@ -300,6 +510,39 @@ async function handleAdmin(req, res, url) {
         ORDER BY l.created_at DESC LIMIT 200`
     )
   ).rows;
+  const products = (
+    await pool.query("SELECT id,slug,title,description,price_cents,active,file_name,file_bytes,updated_at FROM products ORDER BY id")
+  ).rows;
+  const orders = (
+    await pool.query(
+      `SELECT o.*, p.title FROM orders o JOIN products p ON p.id=o.product_id
+        WHERE o.status='paid' ORDER BY o.paid_at DESC LIMIT 200`
+    )
+  ).rows;
+  const base = siteUrl(req);
+  const money = (c, cur = "usd") => (c == null ? "—" : (c / 100).toLocaleString("en-US", { style: "currency", currency: cur.toUpperCase() }));
+  const productForm = (p) => `<form class="prod" data-id="${p?.id || ""}">
+      <div class="g"><label>Title<input name="title" required value="${esc(p?.title)}" placeholder="The Pitch-Ready Checklist"></label>
+      <label>Price (USD)<input name="price" type="number" min="0.5" step="0.01" required value="${p ? (p.price_cents / 100).toFixed(2) : ""}"></label>
+      <label>URL name<input name="slug" required value="${esc(p?.slug)}" placeholder="pitch-checklist"></label>
+      <label class="chk"><input type="checkbox" name="active"${p?.active ? " checked" : ""}> Live on the website</label></div>
+      <label>Description (shown on the site and at checkout)<textarea name="description" rows="3">${esc(p?.description)}</textarea></label>
+      <label>File ${p?.file_name ? `(current: ${esc(p.file_name)}, ${Math.round((p.file_bytes || 0) / 1024)} KB — choose a file only to replace it)` : "(PDF recommended, max 10 MB)"}<input name="file" type="file"></label>
+      <button>${p ? "Save changes" : "Add product"}</button> <span class="msg"></span>
+    </form>`;
+  const shopHtml = `<section><h2>Digital products</h2>
+    ${stripe ? "" : '<p class="warn">Payments are off until STRIPE_SECRET_KEY is added in Render. You can still set up products.</p>'}
+    ${products.map(productForm).join("")}
+    <details${products.length ? "" : " open"}><summary>+ Add a product</summary>${productForm(null)}</details>
+    <h3>Sales (${orders.length})</h3>
+    ${orders.length ? `<table><tr><th>Date</th><th>Product</th><th>Buyer</th><th>Amount</th><th>Downloads</th><th>Link</th></tr>${orders
+      .map(
+        (o) => `<tr><td>${new Date(o.paid_at).toLocaleDateString("en-US", { timeZone: "America/New_York" })}</td><td>${esc(o.title)}</td>
+        <td>${esc(o.name || "")}<br><a href="mailto:${esc(o.email)}">${esc(o.email)}</a></td><td>${money(o.amount_cents, o.currency || "usd")}</td>
+        <td>${o.download_count}/${MAX_DOWNLOADS}</td><td><button type="button" class="copy" data-link="${esc(base + "/download/" + o.download_token)}">Copy link</button></td></tr>`
+      )
+      .join("")}</table>` : "<p>No sales yet.</p>"}
+  </section>`;
   const rows = leads
     .map((l) => {
       const brief = l.ai_brief;
@@ -323,9 +566,31 @@ async function handleAdmin(req, res, url) {
 <style>body{font:15px/1.5 system-ui,sans-serif;margin:0;background:#EEF5F5;color:#14294A}main{max-width:900px;margin:0 auto;padding:24px 16px}
 h1{font-size:1.5rem}.lead{background:#fff;border:1px solid #D5E2E4;border-radius:12px;padding:16px 18px;margin-bottom:14px}
 .lead header{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}small{color:#526276}.brief{background:#F6FAFA;border-left:3px solid #2A919B;padding:10px 14px;margin-top:10px;border-radius:6px}
-.brief p{margin:6px 0}ul{margin:4px 0 0;padding-left:20px}select{font:inherit;padding:4px 6px}</style></head>
-<body><main><h1>Gatherable leads (${leads.length})</h1>${rows || "<p>No leads yet.</p>"}</main>
-<script>document.querySelectorAll('select[data-id]').forEach(s=>s.addEventListener('change',()=>fetch('/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:s.dataset.id,status:s.value})})))</script></body></html>`);
+.brief p{margin:6px 0}ul{margin:4px 0 0;padding-left:20px}select{font:inherit;padding:4px 6px}
+.tabs{display:flex;gap:16px;margin-bottom:8px}#shop section{background:#fff;border:1px solid #D5E2E4;border-radius:12px;padding:18px;margin:12px 0 28px}
+.prod{border:1px solid #D5E2E4;border-radius:10px;padding:14px;margin:12px 0;display:grid;gap:10px}.prod .g{display:grid;grid-template-columns:2fr 1fr 1.4fr 1.2fr;gap:10px;align-items:end}
+.prod label{display:grid;gap:4px;font-size:.85rem;font-weight:600}.prod input,.prod textarea{font:inherit;font-weight:400;padding:7px 9px;border:1px solid #CBD6D5;border-radius:7px}
+.prod .chk{display:flex;gap:8px;align-items:center}.prod .chk input{width:auto}.prod button,.copy{font:inherit;font-weight:600;background:#2A919B;color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;justify-self:start}
+.copy{background:#13468B;padding:5px 10px;font-size:.85rem}.warn{background:#fff6e0;border:1px solid #f0d58a;padding:8px 12px;border-radius:8px}
+table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:8px 6px;border-top:1px solid #E4EAE9;vertical-align:top}
+@media(max-width:700px){.prod .g{grid-template-columns:1fr 1fr}}</style></head>
+<body><main><nav class="tabs"><a href="#leads">Leads</a><a href="#shop">Digital products &amp; sales</a></nav>
+<div id="shop">${shopHtml}</div>
+<h1 id="leads">Leads (${leads.length})</h1>${rows || "<p>No leads yet.</p>"}</main>
+<script>
+document.querySelectorAll('select[data-id]').forEach(s=>s.addEventListener('change',()=>fetch('/admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:s.dataset.id,status:s.value})})));
+document.querySelectorAll('.copy').forEach(b=>b.addEventListener('click',()=>{navigator.clipboard.writeText(b.dataset.link);b.textContent='Copied'}));
+document.querySelectorAll('form.prod').forEach(f=>f.addEventListener('submit',async e=>{
+  e.preventDefault();const m=f.querySelector('.msg'),btn=f.querySelector('button');m.textContent='Saving…';btn.disabled=true;
+  const el=f.elements;const body={id:f.dataset.id||null,title:el.title.value,slug:el.slug.value,price:el.price.value,description:el.description.value,active:el.active.checked};
+  const file=el.file.files[0];
+  if(file){if(file.size>10485760){m.textContent='File must be under 10 MB.';btn.disabled=false;return}
+    body.file={name:file.name,type:file.type,data:await new Promise(r=>{const fr=new FileReader();fr.onload=()=>r(String(fr.result).split(',')[1]);fr.readAsDataURL(file)})}}
+  const r=await fetch('/admin/product',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const d=await r.json().catch(()=>({}));btn.disabled=false;
+  if(r.ok){m.textContent='Saved';setTimeout(()=>location.reload(),600)}else m.textContent=d.error||'Could not save';
+}));
+</script></body></html>`);
 }
 
 // ---------- static ----------
@@ -363,13 +628,17 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
   try {
-    if (url.pathname === "/api/health") return json(res, 200, { ok: true, db: !!pool, ai: !!anthropic });
+    if (url.pathname === "/api/health") return json(res, 200, { ok: true, db: !!pool, ai: !!anthropic, payments: !!stripe });
     if (url.pathname === "/api/intake" && req.method === "POST") return await handleIntake(req, res);
     if (url.pathname === "/api/review" && req.method === "POST") return await handleReview(req, res);
-    if (url.pathname === "/admin") return await handleAdmin(req, res, url);
+    if (url.pathname === "/api/products" && req.method === "GET") return await handleProducts(req, res);
+    if (url.pathname === "/api/checkout" && req.method === "POST") return await handleCheckout(req, res);
+    if (url.pathname === "/api/order" && req.method === "GET") return await handleOrderStatus(req, res, url);
+    if (url.pathname === "/api/stripe-webhook" && req.method === "POST") return await handleStripeWebhook(req, res);
+    if (url.pathname.startsWith("/download/") && req.method === "GET") return await handleDownload(req, res, url.pathname.slice(10));
+    if (url.pathname === "/admin" || url.pathname === "/admin/product") return await handleAdmin(req, res, url);
     if (req.method === "GET" && (await serveStatic(res, url.pathname))) return;
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end('<!doctype html><title>Not found</title><p style="font-family:sans-serif;padding:40px">Page not found. <a href="/">Go to Gatherable</a></p>');
+    notFound(res);
   } catch (e) {
     console.error(e);
     if (!res.headersSent) json(res, e.status || 500, { error: e.status ? e.message : "Something went wrong. Please try again." });

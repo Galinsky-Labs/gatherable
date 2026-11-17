@@ -131,6 +131,7 @@
         document.getElementById("rec-service").textContent = rec.service || "Intro meeting";
         document.getElementById("rec-note").textContent = rec.note || "";
         document.getElementById("rec-extra").hidden = val("role") !== "agency";
+        document.getElementById("rec-buy").hidden = document.getElementById("checklist").hidden;
         var done = document.getElementById("intake-done"); done.hidden = false; done.focus();
       })
       .catch(function (x) {
