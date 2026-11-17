@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Free Pitch Check | Gatherable</title>
+<meta name="description" content="Upload your RFP response, credentials deck or pitch presentation and get an instant scorecard on seven criteria plus the three fixes that matter most. Free, from Gatherable.">
+<link rel="canonical" href="https://gatherablehub.com/pitch-check">
+<meta property="og:title" content="Free Pitch Check | Gatherable">
+<meta property="og:description" content="An instant, senior-level first read on your pitch deck or RFP response.">
+<meta property="og:image" content="https://gatherablehub.com/img/hero.webp">
+<meta name="theme-color" content="#14294A">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css?v=2">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header>
+  <nav class="wrap nav" aria-label="Primary">
+    <a class="logo" href="/" aria-label="Gatherable home"><img src="/img/logo.png" alt="Gatherable" width="161" height="40"></a>
+    <button class="menu-btn" aria-expanded="false" aria-controls="menu" aria-label="Open menu">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+    <ul id="menu">
+      <li><a href="/#services">Services</a></li>
+      <li><a href="/#process">Process</a></li>
+      <li><a href="/#work">Work</a></li>
+      <li><a href="/#about">About</a></li>
+      <li><a href="/#faq">FAQ</a></li>
+      <li><a href="/pitch-check" class="hl" aria-current="page">Free Pitch Check</a></li>
+    </ul>
+    <a class="btn btn-primary" href="/#contact">Book a meeting</a>
+  </nav>
+</header>
+
+<main id="main">
+  <section class="pc-hero">
+    <div class="wrap pc-grid">
+      <div>
+        <span class="eyebrow">Free Pitch Check</span>
+        <h1 style="font-size:clamp(2.2rem,4.6vw,3.4rem)">Would your deck make the final round?</h1>
+        <p class="lead">Upload an RFP response, credentials deck or pitch presentation. In about two minutes you get a scorecard on the seven criteria George Galinsky uses in every review, plus the three fixes that will move the needle.</p>
+        <ol class="how">
+          <li><b>1</b><span><strong>Upload a PDF</strong><br><small>Export from PowerPoint, Keynote or Google Slides.</small></span></li>
+          <li><b>2</b><span><strong>Get your scorecard</strong><br><small>Scores, strengths, top fixes, and the questions a client will ask.</small></span></li>
+          <li><b>3</b><span><strong>Go deeper with George</strong><br><small>Book a meeting for a full review or rehearsal coaching.</small></span></li>
+        </ol>
+        <p class="fine" style="color:var(--muted)">Private by design: your file is sent for analysis and then discarded. It is never stored on our servers or used to train AI.</p>
+      </div>
+
+      <div class="intake" id="pc-box">
+        <form id="pc-form" novalidate>
+          <div class="grid2">
+            <div><label for="p-name">Name *</label><input id="p-name" name="name" autocomplete="name" required></div>
+            <div><label for="p-email">Work email *</label><input id="p-email" name="email" type="email" autocomplete="email" required></div>
+            <div><label for="p-company">Company</label><input id="p-company" name="company" autocomplete="organization"></div>
+            <div><label for="p-role">I'm at</label><select id="p-role" name="role"><option value="agency">An agency</option><option value="brand">A brand</option></select></div>
+            <div class="full"><label for="p-type">Document type</label>
+              <select id="p-type" name="docType"><option>Pitch presentation</option><option>RFP response</option><option>Credentials deck</option><option>Campaign presentation</option><option>Other</option></select></div>
+            <div class="full"><label for="p-context">Context (optional)</label><textarea id="p-context" name="context" style="min-height:90px" placeholder="Who is the client, what did the brief ask for, who else is pitching?"></textarea></div>
+            <div class="full">
+              <label class="drop" id="drop" for="p-file">
+                <input id="p-file" type="file" accept="application/pdf,.pdf">
+                <strong>Drop your PDF here or click to choose</strong>
+                <small>PDF up to 15 MB</small>
+                <span class="file-chip" id="file-chip" hidden></span>
+              </label>
+            </div>
+            <div class="full"><label class="check"><input type="checkbox" name="consent" id="p-consent"> I'm authorised to share this document, and I agree that Gatherable may contact me about my results.</label></div>
+          </div>
+          <p class="form-error" id="pc-error" role="alert" hidden></p>
+          <div class="nav-btns"><button type="submit" class="btn btn-primary" id="pc-submit">Run my Pitch Check →</button></div>
+        </form>
+
+        <div class="loading" id="pc-loading" hidden aria-live="polite">
+          <div class="spinner" aria-hidden="true"></div>
+          <h3 style="font-size:1.3rem" id="pc-stage">Reading your document…</h3>
+          <p class="form-note">This usually takes one to two minutes. Please keep this page open.</p>
+        </div>
+
+        <div class="result" id="pc-result" hidden tabindex="-1"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>© 2026 Gatherable, LLC · Stonington, CT</span>
+    <a href="mailto:galinsky.george@gmail.com">galinsky.george@gmail.com</a>
+  </div>
+</footer>
+<script src="/intake.js?v=2" defer></script>
+<script src="/pitch-check.js?v=2" defer></script>
+</body>
+</html>
